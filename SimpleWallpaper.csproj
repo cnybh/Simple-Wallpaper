@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>SimpleWallpaper</AssemblyName>
+    <RootNamespace>SimpleWallpaper</RootNamespace>
+    <AssemblyTitle>Simple Wallpaper</AssemblyTitle>
+    <Product>Simple Wallpaper</Product>
+    <Company>Bohang</Company>
+    <Version>2.0.0</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>logo.ico</ApplicationIcon>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <!-- The WPF implicit-using set does not include these. -->
+  <ItemGroup>
+    <Using Include="System.IO" />
+    <Using Include="System.Net.Http" />
+  </ItemGroup>
+
+  <!-- The shell extension DLL is compiled from ShellExt\SimpleWallpaperShell.cpp with MinGW (see
+       that folder). It must sit next to the executable, because it is registered machine-wide by
+       absolute path, so it is copied explicitly for both build and publish. -->
+  <Target Name="CopyShellExtension" AfterTargets="Build">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\ShellExt\SimpleWallpaperShell.dll"
+          DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
+
+  <Target Name="CopyShellExtensionToPublish" AfterTargets="Publish">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\ShellExt\SimpleWallpaperShell.dll"
+          DestinationFolder="$(PublishDir)" SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>

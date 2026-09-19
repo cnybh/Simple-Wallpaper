@@ -1,0 +1,31 @@
+<Window x:Class="SimpleWallpaper.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="450"
+        SizeToContent="Height"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <CheckBox x:Name="StartupCheck" Grid.Row="0" Margin="0,4"
+                  Checked="StartupCheck_Changed" Unchecked="StartupCheck_Changed" />
+        <CheckBox x:Name="LockScreenCheck" Grid.Row="1" Margin="0,10,0,4"
+                  Checked="LockScreenCheck_Changed" Unchecked="LockScreenCheck_Changed" />
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">
+            <Button x:Name="AboutButton" Width="110" Padding="0,5" Click="AboutButton_Click" />
+            <Button x:Name="ReleaseButton" Width="160" Padding="0,5" Margin="10,0,0,0" Click="ReleaseButton_Click" />
+        </StackPanel>
+
+        <Separator Grid.Row="3" Margin="0,20,0,0" />
+
+        <Button x:Name="RestoreButton" Grid.Row="4" Margin="0,16,0,0" Padding="0,8" Click="RestoreButton_Click" />
+    </Grid>
+</Window>
