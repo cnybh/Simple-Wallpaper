@@ -1,31 +1,113 @@
 <Window x:Class="SimpleWallpaper.SettingsWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Width="450"
+        Width="700"
         SizeToContent="Height"
         ResizeMode="NoResize"
+        UseLayoutRounding="True"
         WindowStartupLocation="CenterScreen">
-    <Grid Margin="18">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
-        </Grid.RowDefinitions>
+    <!-- The content sits 8 from the top and 16 from the foot: lifted to where it reads as "up",
+         while the foot keeps the margin the two aligned columns need. -->
+    <Grid Margin="16,8,16,16">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="16" />
+            <ColumnDefinition Width="320" />
+        </Grid.ColumnDefinitions>
 
-        <CheckBox x:Name="StartupCheck" Grid.Row="0" Margin="0,4"
-                  Checked="StartupCheck_Changed" Unchecked="StartupCheck_Changed" />
-        <CheckBox x:Name="LockScreenCheck" Grid.Row="1" Margin="0,10,0,4"
-                  Checked="LockScreenCheck_Changed" Unchecked="LockScreenCheck_Changed" />
+        <!-- Left, but not flat: the switch cycle is left open and the way back to the defaults is
+             pressed against the bottom, so the two groups stay apart whatever the wallpaper panel
+             opposite is tall. -->
+        <Grid Grid.Column="0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
 
-        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,20,0,0">
-            <Button x:Name="AboutButton" Width="110" Padding="0,5" Click="AboutButton_Click" />
-            <Button x:Name="ReleaseButton" Width="160" Padding="0,5" Margin="10,0,0,0" Click="ReleaseButton_Click" />
-        </StackPanel>
+            <StackPanel Grid.Row="0" VerticalAlignment="Top">
+                <!-- The cycle, the countdown that belongs to it and the categories it downloads for
+                     are one choice, so the frame holds all three. -->
+                <GroupBox x:Name="CycleGroup" Padding="10">
+                    <StackPanel>
+                        <TextBlock x:Name="NextSwitchText" Foreground="#6A6A6A" />
+                        <ComboBox x:Name="ModeBox" Height="30" Margin="0,8,0,0"
+                                  VerticalContentAlignment="Center" SelectionChanged="ModeBox_SelectionChanged" />
+                        <Button x:Name="CategoryButton" Height="30" Margin="0,8,0,0" Click="CategoryButton_Click" />
+                    </StackPanel>
+                </GroupBox>
 
-        <Separator Grid.Row="3" Margin="0,20,0,0" />
+                <!-- Sized to the same 30 as the controls above, so the group reads as one column. -->
+                <CheckBox x:Name="StartupCheck" Height="30" Margin="0,10,0,0" VerticalContentAlignment="Center"
+                          Checked="StartupCheck_Changed" Unchecked="StartupCheck_Changed" />
+                <CheckBox x:Name="LockScreenCheck" Height="30" VerticalContentAlignment="Center"
+                          Checked="LockScreenCheck_Changed" Unchecked="LockScreenCheck_Changed" />
+            </StackPanel>
 
-        <Button x:Name="RestoreButton" Grid.Row="4" Margin="0,16,0,0" Padding="0,8" Click="RestoreButton_Click" />
+            <!-- Read upwards: the exit at the bottom, the release page and about above it. Its bottom
+                 edge lines up with the bottom of the wallpaper box, which is the taller of the two. -->
+            <StackPanel Grid.Row="2" VerticalAlignment="Bottom" Margin="0,0,0,1">
+                <!-- A grid rather than a right-aligned row: the about button starts at the same left
+                     edge as the exit button below it and takes what is left, instead of a fixed 110. -->
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="10" />
+                        <ColumnDefinition Width="160" />
+                    </Grid.ColumnDefinitions>
+
+                    <Button x:Name="AboutButton" Grid.Column="0" Height="30" Click="AboutButton_Click" />
+                    <Button x:Name="ReleaseButton" Grid.Column="2" Height="30" Click="ReleaseButton_Click" />
+                </Grid>
+
+                <!-- 9 rather than 10: the pixel it gives up is the margin below, which is what lifts
+                     the exit button by one pixel without moving anything above it. -->
+                <Separator Margin="0,10,0,9" />
+
+                <Button x:Name="RestoreButton" Height="30" Click="RestoreButton_Click" />
+            </StackPanel>
+        </Grid>
+
+        <!-- Right: the wallpaper that is on screen, with its source and the two actions on it. -->
+        <GroupBox x:Name="CurrentGroup" Grid.Column="2" Padding="10">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <Border Grid.Row="0" MinHeight="160" Background="White" BorderBrush="#FFBFBFBF" BorderThickness="1">
+                    <Grid>
+                        <TextBlock x:Name="NoWallpaperText" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                   Foreground="#6A6A6A" />
+                        <Image x:Name="ThumbnailImage" Stretch="Uniform" />
+                    </Grid>
+                </Border>
+
+                <TextBlock Grid.Row="1" Margin="0,10,0,0" TextWrapping="Wrap">
+                    <Run x:Name="SourceLabelRun" />
+                    <Hyperlink x:Name="SourceLink" Click="SourceLink_Click"
+                               Foreground="Blue" TextDecorations="Underline" />
+                    <Run x:Name="SourcePlainRun" />
+                </TextBlock>
+
+                <!-- The next wallpaper and the like sit side by side, with the space between them. -->
+                <Grid Grid.Row="2" Margin="0,10,0,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="10" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+
+                    <Button x:Name="LikeButton" Grid.Column="0" Height="30" Click="LikeButton_Click" />
+                    <Button x:Name="NextButton" Grid.Column="2" Height="30" Click="NextButton_Click" />
+                </Grid>
+
+                <TextBlock x:Name="StatusText" Grid.Row="3" Margin="0,8,0,0" TextWrapping="Wrap"
+                           Foreground="#6A6A6A" Visibility="Collapsed" />
+            </Grid>
+        </GroupBox>
     </Grid>
 </Window>

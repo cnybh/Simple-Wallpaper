@@ -22,7 +22,12 @@
 
   <application xmlns="urn:schemas-microsoft-com:asm.v3">
     <windowsSettings>
-      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true</dpiAware>
+      <!-- Per-monitor v2, with the older two declarations kept as fallbacks: a process that only
+           says "dpiAware=true" is system aware, and Windows then bitmap-stretches its windows when
+           they are dragged to a screen with a different scale factor. Declaring the awareness here
+           is what stops the runtime from setting it, so it has to be spelled out. -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/PM</dpiAware>
     </windowsSettings>
   </application>
 </assembly>

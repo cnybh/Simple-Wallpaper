@@ -12,7 +12,43 @@ internal sealed class AppState
 {
     [JsonPropertyName("current_path")] public string CurrentPath { get; set; } = string.Empty;
     [JsonPropertyName("pending_path")] public string PendingPath { get; set; } = string.Empty;
-    [JsonPropertyName("last_run_date")] public string LastRunDate { get; set; } = string.Empty;
+
+    // What the API said about the two pictures, so the settings window can show the name and where
+    // the picture came from without asking the network again.
+    [JsonPropertyName("current_title")] public string CurrentTitle { get; set; } = string.Empty;
+    [JsonPropertyName("current_source")] public string CurrentSource { get; set; } = string.Empty;
+    [JsonPropertyName("current_url")] public string CurrentUrl { get; set; } = string.Empty;
+    [JsonPropertyName("pending_title")] public string PendingTitle { get; set; } = string.Empty;
+    [JsonPropertyName("pending_source")] public string PendingSource { get; set; } = string.Empty;
+    [JsonPropertyName("pending_url")] public string PendingUrl { get; set; } = string.Empty;
+
+    /// <summary>The cycle the user picked in the settings window; see <see cref="SwitchSchedule"/>.</summary>
+    [JsonPropertyName("switch_mode")] public string SwitchMode { get; set; } = SwitchSchedule.Default;
+
+    /// <summary>
+    /// Handshake for a cycle change: the settings window counts its request up, the program copies
+    /// the number back once the new mode is saved. The dialog the settings window shows "switching
+    /// to ..." in waits for that copy, so it never claims a change that was not applied.
+    /// </summary>
+    [JsonPropertyName("mode_request_seq")] public long ModeRequestSeq { get; set; }
+    [JsonPropertyName("mode_applied_seq")] public long ModeAppliedSeq { get; set; }
+
+    /// <summary>When the next switch is due, local time. The scheduler only compares it with now.</summary>
+    [JsonPropertyName("next_switch_at")] public DateTime NextSwitchAt { get; set; } = DateTime.MinValue;
+
+    /// <summary>
+    /// Why the cycle stands still (see <see cref="SwitchSchedule.PauseReason"/>), empty while it runs.
+    /// It lives in the state so a restart keeps showing flat battery or no network instead of a
+    /// countdown that nothing is counting down to.
+    /// </summary>
+    [JsonPropertyName("pause_reason")] public string PauseReason { get; set; } = string.Empty;
+
+    /// <summary>The wallpaper subjects the user ticked; empty means "never picked" (see Categories).</summary>
+    [JsonPropertyName("categories")] public List<string> Categories { get; set; } = new();
+
+    /// <summary>Wallpapers the user liked: their files are kept and are drawn from on later switches.</summary>
+    [JsonPropertyName("likes")] public List<LikedWallpaper> Likes { get; set; } = new();
+
     [JsonPropertyName("lock_screen_enabled")] public bool LockScreenEnabled { get; set; } = true;
 
     private static readonly object Gate = new();
@@ -31,8 +67,6 @@ internal sealed class AppState
     /// click over - so both sides must agree on one path.
     /// </summary>
     public static string ReadyFlagPath => Path.Combine(DataDirectory, "next-ready.flag");
-
-    public static string Today => DateTime.Now.ToString("yyyy-MM-dd");
 
     public static void EnsureDataDirectory()
     {
@@ -103,46 +137,12 @@ internal sealed class AppState
     }
 }
 
-/// <summary>One-shot timer that runs a callback at the next local midnight and reschedules itself.</summary>
-internal sealed class MidnightScheduler : IDisposable
+/// <summary>One wallpaper the user liked. The file is kept on disk and used as a switch target.</summary>
+internal sealed class LikedWallpaper
 {
-    private readonly Action _onMidnight;
-    private Timer? _timer;
-
-    public MidnightScheduler(Action onMidnight) => _onMidnight = onMidnight;
-
-    public void Start()
-    {
-        _timer = new Timer(_ => Tick(), null, TimeUntilNextMidnight(DateTime.Now), Timeout.InfiniteTimeSpan);
-    }
-
-    public static TimeSpan TimeUntilNextMidnight(DateTime now)
-    {
-        var due = now.Date.AddDays(1) - now;
-        return due < TimeSpan.FromSeconds(1) ? TimeSpan.FromSeconds(1) : due;
-    }
-
-    private void Tick()
-    {
-        try
-        {
-            _onMidnight();
-        }
-        catch (Exception ex)
-        {
-            AppState.Log("midnight task failed: " + ex.Message);
-        }
-        finally
-        {
-            try
-            {
-                _timer?.Change(TimeUntilNextMidnight(DateTime.Now), Timeout.InfiniteTimeSpan);
-            }
-            catch (ObjectDisposedException)
-            {
-            }
-        }
-    }
-
-    public void Dispose() => _timer?.Dispose();
+    [JsonPropertyName("path")] public string Path { get; set; } = string.Empty;
+    [JsonPropertyName("title")] public string Title { get; set; } = string.Empty;
+    [JsonPropertyName("source")] public string Source { get; set; } = string.Empty;
+    [JsonPropertyName("url")] public string Url { get; set; } = string.Empty;
+    [JsonPropertyName("liked_at")] public DateTime LikedAt { get; set; } = DateTime.Now;
 }

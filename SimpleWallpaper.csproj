@@ -11,9 +11,9 @@
     <AssemblyTitle>Simple Wallpaper</AssemblyTitle>
     <Product>Simple Wallpaper</Product>
     <Company>Bohang</Company>
-    <Version>2.0.0</Version>
+    <Version>1.0.0</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <ApplicationIcon>logo.ico</ApplicationIcon>
+    <ApplicationIcon>logo2.ico</ApplicationIcon>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 
@@ -21,6 +21,12 @@
   <ItemGroup>
     <Using Include="System.IO" />
     <Using Include="System.Net.Http" />
+  </ItemGroup>
+
+  <!-- The about box draws this icon from the assembly. ApplicationIcon only sets the Win32 icon of
+       the executable; without packing the file as a resource the box finds nothing to draw. -->
+  <ItemGroup>
+    <Resource Include="logo2.ico" />
   </ItemGroup>
 
   <!-- The shell extension DLL is compiled from ShellExt\SimpleWallpaperShell.cpp with MinGW (see

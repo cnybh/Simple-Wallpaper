@@ -79,7 +79,61 @@ internal static class DisplayHelper
     [DllImport("ntdll.dll", CharSet = CharSet.Unicode)]
     private static extern int RtlGetVersion(ref RTL_OSVERSIONINFOW lpVersionInformation);
 
+    [DllImport("shcore.dll")]
+    private static extern int GetProcessDpiAwareness(IntPtr hProcess, out int awareness);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetThreadDpiAwarenessContext();
+
+    [DllImport("user32.dll")]
+    private static extern bool AreDpiAwarenessContextsEqual(IntPtr first, IntPtr second);
+
+    /// <summary>DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 is the pseudo handle -4.</summary>
+    private static readonly IntPtr PerMonitorV2Context = new(-4);
+
     #endregion
+
+    /// <summary>
+    /// How Windows scales this process, read back from the running process rather than from the
+    /// manifest: it is the answer the windows are actually laid out against. A process left at
+    /// "system" gets bitmap-stretched on a screen whose scale differs from the one it started on.
+    /// </summary>
+    public static string DpiAwarenessText()
+    {
+        try
+        {
+            if (GetProcessDpiAwareness(GetCurrentProcess(), out var awareness) != 0) return "unknown";
+
+            return awareness switch
+            {
+                0 => "unaware",
+                1 => "system",
+                2 => IsPerMonitorV2() ? "per-monitor v2" : "per-monitor",
+                _ => "unknown",
+            };
+        }
+        catch (Exception ex)
+        {
+            AppState.Log("reading the DPI awareness failed: " + ex.Message);
+            return "unknown";
+        }
+    }
+
+    private static bool IsPerMonitorV2()
+    {
+        try
+        {
+            return AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), PerMonitorV2Context);
+        }
+        catch (Exception ex)
+        {
+            AppState.Log("comparing the DPI awareness contexts failed: " + ex.Message);
+            return false;
+        }
+    }
 
     /// <summary>Physical resolution of the primary display, with a GetDeviceCaps fallback.</summary>
     public static (int Width, int Height) GetPrimaryResolution()

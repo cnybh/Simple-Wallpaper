@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
@@ -18,6 +19,10 @@ internal static class Program
     internal const string CommandNext = "NEXT";
     internal const string CommandExit = "EXIT";
     internal const string CommandPing = "PING";
+    /// <summary>The settings window picked another cycle: recompute the next switch from now.</summary>
+    internal const string CommandMode = "MODE";
+    /// <summary>The settings window changed the categories: fetch and apply a new wallpaper at once.</summary>
+    internal const string CommandCategory = "CATEGORY";
 
     /// <summary>Where a menu entry leaves its command for the running program.</summary>
     private static string CommandFile => Path.Combine(AppState.DataDirectory, "command.txt");
@@ -37,6 +42,12 @@ internal static class Program
 
     private static readonly TimeSpan NetworkEventDebounce = TimeSpan.FromSeconds(10);
 
+    /// <summary>How often the persisted "next switch" moment is compared with the clock.</summary>
+    private static readonly TimeSpan SchedulePollInterval = TimeSpan.FromSeconds(15);
+
+    /// <summary>How long a category change waits for a switch that is already running.</summary>
+    private static readonly TimeSpan CategoryChangeWait = TimeSpan.FromSeconds(10);
+
     // A click that finds no running program starts it again. The first picture still has to be
     // downloaded before that click can be answered, so the wait for it covers a slow connection.
     private static readonly TimeSpan ReadyTimeout = TimeSpan.FromSeconds(60);
@@ -45,10 +56,25 @@ internal static class Program
     private static readonly object RetryGate = new();
 
     private static Mutex? _instanceMutex;
-    private static Timer? _retryTimer;
     private static Timer? _commandTimer;
+    private static Timer? _scheduleTimer;
+
+    /// <summary>Index into <see cref="RetryBackoff"/>; reset by every successful switch.</summary>
     private static int _retryAttempt;
-    private static DateTime _lastNetworkRetryUtc = DateTime.MinValue;
+
+    /// <summary>1 while a switch attempt is running, so two attempts never overlap.</summary>
+    private static int _switchRunning;
+
+    /// <summary>1 while the last attempt failed and is waiting for its retry.</summary>
+    private static int _awaitingRetry;
+
+    private static long _lastNetworkRetry;
+
+    /// <summary>Read on the scheduler thread only; true while the internet looked unreachable.</summary>
+    private static bool _offline;
+
+    /// <summary>Tick count of the last online probe, so the ten minute gap survives a restarted tick.</summary>
+    private static long _lastNetworkCheck;
 
     [STAThread]
     private static void Main(string[] args)
@@ -98,18 +124,18 @@ internal static class Program
         StartCommandWatcher(wallpapers);
         StartNetworkWatcher(wallpapers);
 
-        // Fill the queue before the daily task, so a click that arrives early can already be
-        // answered instantly instead of waiting for a download.
-        wallpapers.EnsurePrefetched();
-        wallpapers.SyncMenuState();
-        RunDailyTaskInBackground(wallpapers);
+        // The cycle starts with a switch right away, whatever mode is in effect, and follows the mode
+        // the user picked from then on. Both run on background threads: neither start-up nor a logon
+        // may wait on the network.
+        RunScheduledSwitchInBackground(wallpapers);
+        StartScheduleTimer(wallpapers);
 
-        using (var midnight = new MidnightScheduler(() => RunDailyTaskAndReschedule(wallpapers)))
-        {
-            midnight.Start();
-            Shutdown.Wait();
-        }
+        AppState.Log($"cycle {SwitchSchedule.Normalize(AppState.Load().SwitchMode)}; "
+            + $"power {AcPowerOnline() switch { true => "mains", false => "battery" }}");
 
+        Shutdown.Wait();
+
+        _scheduleTimer?.Dispose();
         RegistryHelper.UnregisterDesktopMenu();
         ReleaseInstanceMutex();
         AppState.Log("stopped; desktop menu removed");
@@ -441,6 +467,16 @@ internal static class Program
                 wallpapers.ApplyNext(out _);   // ApplyNext logs its own outcome
                 break;
 
+            case CommandMode:
+                wallpapers.OnModeChanged(AcPowerOnline(), _offline);
+                break;
+
+            case CommandCategory:
+                // Downloading takes a while and this thread also reads the command file, so the
+                // category change gets its own thread.
+                RunScheduledSwitchInBackground(wallpapers, freshDownload: true);
+                break;
+
             case CommandExit:
                 AppState.Log("exit requested");
                 Shutdown.Set();
@@ -485,64 +521,251 @@ internal static class Program
 
     #endregion
 
-    #region Daily task scheduling
+    #region Switch scheduling
 
     /// <summary>
-    /// Runs the daily task on a background thread: neither start-up nor a logon may wait on the
-    /// network.
+    /// The switch runs on a background thread: neither start-up nor a logon may wait on the network.
+    /// Called once at start-up (a new run always switches once) and for every category change.
     /// </summary>
-    private static void RunDailyTaskInBackground(WallpaperManager wallpapers)
+    private static void RunScheduledSwitchInBackground(WallpaperManager wallpapers, bool freshDownload = false)
     {
-        var thread = new Thread(() => RunDailyTaskAndReschedule(wallpapers))
+        var thread = new Thread(() => RunScheduledSwitch(wallpapers, freshDownload))
         {
             IsBackground = true,
-            Name = "DailyWallpaperTask",
+            Name = "WallpaperSwitch",
         };
 
         thread.Start();
     }
 
-    private static void RunDailyTaskAndReschedule(WallpaperManager wallpapers)
+    /// <summary>
+    /// Compares the persisted "next switch" moment with the clock every few seconds. Polling instead
+    /// of arming one long timer is what covers sleep, hibernation, a changed system time and a missed
+    /// logon: the moment is simply due when it has passed.
+    /// </summary>
+    private static void StartScheduleTimer(WallpaperManager wallpapers)
+    {
+        _scheduleTimer = new Timer(_ => EvaluateSchedule(wallpapers), null,
+            SchedulePollInterval, SchedulePollInterval);
+    }
+
+    /// <summary>
+    /// One tick: keeps the reason the cycle stands still up to date, and switches when no reason is
+    /// left. Reading the power state on the same tick costs one call and makes a flat battery behave
+    /// exactly as it does when the logon is on a laptop.
+    /// </summary>
+    private static void EvaluateSchedule(WallpaperManager wallpapers)
     {
         try
         {
-            if (wallpapers.RunDailyTask())
-            {
-                lock (RetryGate)
-                {
-                    _retryAttempt = 0;
-                    _retryTimer?.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
-                }
+            var state = RefreshCycleState(wallpapers);
+            if (state.PauseReason.Length > 0) return;   // the cycle is on hold: nothing is due
+            if (DateTime.Now < state.NextSwitchAt) return;
 
-                return;
-            }
+            RunScheduledSwitch(wallpapers);
         }
         catch (Exception ex)
         {
-            AppState.Log("daily task failed: " + ex.Message);
-        }
-
-        ScheduleRetry(wallpapers);
-    }
-
-    /// <summary>Schedules the next attempt with a growing delay: 1, 5, 15 and then 30 minutes.</summary>
-    private static void ScheduleRetry(WallpaperManager wallpapers)
-    {
-        lock (RetryGate)
-        {
-            var delay = RetryBackoff[Math.Min(_retryAttempt, RetryBackoff.Length - 1)];
-            _retryAttempt++;
-
-            _retryTimer ??= new Timer(_ => RunDailyTaskAndReschedule(wallpapers));
-            _retryTimer.Change(delay, Timeout.InfiniteTimeSpan);
-
-            AppState.Log($"daily task retry #{_retryAttempt} scheduled in {delay.TotalMinutes:0} minute(s)");
+            AppState.Log("evaluating the switch cycle failed: " + ex.Message);
         }
     }
 
     /// <summary>
+    /// Reads the power state and, every ten minutes, the network. The network is what a paused cycle
+    /// depends on most (it has to be asked again to know it came back), so while the program is
+    /// offline the check keeps running even though the switches do not.
+    /// </summary>
+    private static AppState RefreshCycleState(WallpaperManager wallpapers)
+    {
+        if (ShouldCheckNetwork()) CheckOnline();
+
+        return wallpapers.RefreshReason(AppState.Load(), AcPowerOnline(), _offline);
+    }
+
+    /// <summary>
+    /// On every tick while the network looks fine - the check is a local adapter scan, and losing
+    /// the network has to be noticed within seconds - and ten minutes apart once it is gone, which
+    /// is how often a dead network is worth asking about.
+    /// </summary>
+    private static bool ShouldCheckNetwork()
+    {
+        if (!_offline)
+        {
+            _lastNetworkCheck = Environment.TickCount64;
+            return true;
+        }
+
+        return Environment.TickCount64 - _lastNetworkCheck
+            >= (long)WallpaperManager.NetworkCheckInterval.TotalMilliseconds;
+    }
+
+    /// <summary>
+    /// Asks whether the internet is reachable. Losing it and regaining it are both put in the log:
+    /// the cycle itself is carried on by <see cref="RefreshReason"/>, which turns the answer into
+    /// the state the settings window shows.
+    /// </summary>
+    private static void CheckOnline()
+    {
+        var reachable = HasInternetConnection();
+        if (reachable == !_offline) return;
+
+        _offline = !reachable;
+        AppState.Log(reachable
+            ? "network became reachable again"
+            : "network is unreachable; checking again every ten minutes");
+    }
+
+    /// <summary>
+    /// Whether an adapter that can actually reach the internet is up. NetworkInterface's own
+    /// GetIsNetworkAvailable answers yes as soon as any adapter is up, and a VMware or Wi-Fi Direct
+    /// adapter holding nothing but a link-local address is up all the time - which is why the cycle
+    /// would never see a dead network. An address that is neither loopback nor link-local is what a
+    /// real connection has.
+    /// </summary>
+    private static bool HasInternetConnection()
+    {
+        try
+        {
+            foreach (var adapter in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (adapter.OperationalStatus != OperationalStatus.Up) continue;
+                if (adapter.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+                if (adapter.NetworkInterfaceType == NetworkInterfaceType.Tunnel) continue;
+
+                foreach (var address in adapter.GetIPProperties().UnicastAddresses)
+                {
+                    if (address.Address.AddressFamily == AddressFamily.InterNetwork)
+                    {
+                        if (!address.Address.ToString().StartsWith("169.254.", StringComparison.Ordinal)) return true;
+                    }
+                    else if (address.Address.AddressFamily == AddressFamily.InterNetworkV6
+                        && !address.Address.IsIPv6LinkLocal)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            AppState.Log("checking the network failed: " + ex.Message);
+            return true;   // unknown: a pause over an unreadable answer helps nobody
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// AC power through GetSystemPowerStatus: the same Win32 call Windows uses for the battery
+    /// symbol, so the program needs neither SystemEvents nor the WinForms stack for it. When the
+    /// answer cannot be read, the program stays on the safe side and assumes the mains.
+    /// </summary>
+    private static bool AcPowerOnline()
+    {
+        try
+        {
+            if (GetSystemPowerStatus(out var status) && status.ACLineStatus != 255)
+            {
+                return status.ACLineStatus == 1;
+            }
+        }
+        catch (Exception ex)
+        {
+            AppState.Log("reading the power state failed: " + ex.Message);
+        }
+
+        return true;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SystemPowerStatus
+    {
+        public byte ACLineStatus;
+        public byte BatteryFlag;
+        public byte BatteryLifePercent;
+        public byte SystemStatusFlag;
+        public uint BatteryLifeTime;
+        public uint BatteryFullLifeTime;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern bool GetSystemPowerStatus(out SystemPowerStatus status);
+
+    /// <summary>
+    /// One switch attempt. Only an applied wallpaper moves the cycle on; a failed attempt backs off,
+    /// and the delay is carried in the state, so the next tick simply waits it out. Returns false when
+    /// another attempt is already running - a category change then waits for its turn instead of being
+    /// dropped. A manual click never comes through here, which is what keeps it away from the cycle.
+    /// </summary>
+    private static bool RunScheduledSwitch(WallpaperManager wallpapers, bool freshDownload = false)
+    {
+        if (!TryTakeSwitchSlot(waitForIt: freshDownload)) return false;
+
+        try
+        {
+            var applied = false;
+            try
+            {
+                applied = freshDownload
+                    ? wallpapers.ApplyCategoryChange(out _)
+                    : wallpapers.ApplyScheduled(out _);
+            }
+            catch (Exception ex)
+            {
+                AppState.Log("the switch failed: " + ex.Message);
+            }
+
+            if (applied)
+            {
+                Volatile.Write(ref _retryAttempt, 0);
+                Volatile.Write(ref _awaitingRetry, 0);
+                return true;
+            }
+
+            lock (RetryGate)
+            {
+                var attempt = _retryAttempt;
+                var delay = RetryBackoff[Math.Min(attempt, RetryBackoff.Length - 1)];
+                _retryAttempt = attempt + 1;
+
+                var state = AppState.Load();
+                state.NextSwitchAt = DateTime.Now + delay;
+                state.Save();
+
+                Volatile.Write(ref _awaitingRetry, 1);
+                AppState.Log($"switch attempt failed; retry #{attempt + 1} in {delay.TotalMinutes:0} minute(s)");
+            }
+
+            return true;
+        }
+        finally
+        {
+            Volatile.Write(ref _switchRunning, 0);
+        }
+    }
+
+    /// <summary>
+    /// Takes the single switch slot. Returns false when another attempt holds it - or, for a category
+    /// change, when it held it for longer than <see cref="CategoryChangeWait"/>.
+    /// </summary>
+    private static bool TryTakeSwitchSlot(bool waitForIt)
+    {
+        if (Interlocked.Exchange(ref _switchRunning, 1) == 0) return true;   // the slot is ours
+        if (!waitForIt) return false;
+
+        for (var waited = TimeSpan.Zero; waited < CategoryChangeWait; waited += ReadyPollInterval)
+        {
+            Thread.Sleep(ReadyPollInterval);
+            if (Interlocked.Exchange(ref _switchRunning, 1) == 0) return true;   // that one finished
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Retries the moment the network comes back, which at logon is usually seconds after the first
-    /// attempt failed. Both events are watched because either can fire first.
+    /// attempt failed. Both events are watched because either can fire first, and a switch that is
+    /// merely waiting for a later cycle is left alone.
     /// </summary>
     private static void StartNetworkWatcher(WallpaperManager wallpapers)
     {
@@ -552,7 +775,7 @@ internal static class Program
             {
                 NetworkChange.NetworkAvailabilityChanged += (_, e) => OnNetworkChanged(wallpapers, e.IsAvailable);
                 NetworkChange.NetworkAddressChanged += (_, _) =>
-                    OnNetworkChanged(wallpapers, NetworkInterface.GetIsNetworkAvailable());
+                    OnNetworkChanged(wallpapers, HasInternetConnection());
             }
             catch (Exception ex)
             {
@@ -569,17 +792,32 @@ internal static class Program
 
     private static void OnNetworkChanged(WallpaperManager wallpapers, bool available)
     {
-        if (!available) return;
-
-        // Availability changes arrive in bursts (adapter up, address bound, ...): act once.
-        lock (RetryGate)
+        // The scheduler owns the decision: it recomputes the reason on its next tick and re-arms the
+        // cycle, but only switches when the cycle actually runs. Switching here would put a new
+        // picture up through a "no cycling" or a flat battery, which are exactly the states the
+        // user asked to be left alone.
+        if (available && _offline)
         {
-            if (DateTime.UtcNow - _lastNetworkRetryUtc < NetworkEventDebounce) return;
-            _lastNetworkRetryUtc = DateTime.UtcNow;
+            _offline = false;
+            AppState.Log("network became available; the cycle picks it up on its next check");
+            return;
         }
 
-        AppState.Log("network became available; retrying the daily task now");
-        RunDailyTaskInBackground(wallpapers);
+        if (!available) return;
+        if (Volatile.Read(ref _awaitingRetry) == 0) return;   // nothing is waiting on the network
+        if (AppState.Load().PauseReason.Length > 0) return;   // the cycle stands still: nothing is due
+
+        // Availability changes arrive in bursts (adapter up, address bound, ...): act once.
+        if (Environment.TickCount64 - _lastNetworkRetry < (long)NetworkEventDebounce.TotalMilliseconds) return;
+        _lastNetworkRetry = Environment.TickCount64;
+
+        lock (RetryGate)
+        {
+            _retryAttempt = 0;   // the backoff is over: try as if it were the first attempt
+        }
+
+        AppState.Log("network became available; retrying the switch now");
+        RunScheduledSwitchInBackground(wallpapers);
     }
 
     #endregion
@@ -613,6 +851,9 @@ internal static class SelfTest
             var (width, height) = DisplayHelper.GetPrimaryResolution();
             Check("primary resolution detected", width > 0 && height > 0, $"{width}x{height}");
 
+            var dpi = DisplayHelper.DpiAwarenessText();
+            Check("display scaling mode", dpi == "per-monitor v2", dpi);
+
             Check("windows version readable", DisplayHelper.IsWindows10OrGreater(), DisplayHelper.OSVersionText);
             Check("lock screen support evaluated", true,
                 DisplayHelper.SupportsLockScreenWallpaper() ? "supported" : "unsupported");
@@ -621,10 +862,30 @@ internal static class SelfTest
             Check("winrt lock screen api reachable", reachable, "Windows.System.UserProfile.LockScreen");
             Check("current lock screen image", true, lockImage ?? "<none>");
 
-            var state = new AppState { CurrentPath = @"C:\temp\a.jpg", PendingPath = @"C:\temp\b.jpg" };
+            var state = new AppState
+            {
+                CurrentPath = @"C:\temp\a.jpg",
+                CurrentTitle = "山间云海",
+                CurrentSource = "birdpaper",
+                SwitchMode = SwitchSchedule.Interval120,
+                NextSwitchAt = new DateTime(2030, 1, 2, 3, 4, 5),
+                ModeRequestSeq = 7,
+                ModeAppliedSeq = 6,
+                Categories = new List<string> { "nature", "city" },
+                Likes = new List<LikedWallpaper> { new() { Path = @"C:\temp\a.jpg", Title = "山间云海" } },
+            };
             var restored = JsonSerializer.Deserialize<AppState>(JsonSerializer.Serialize(state));
             Check("state.json round trip",
-                restored != null && restored.CurrentPath == state.CurrentPath && restored.PendingPath == state.PendingPath);
+                restored != null
+                && restored.CurrentPath == state.CurrentPath
+                && restored.CurrentTitle == state.CurrentTitle
+                && restored.CurrentSource == state.CurrentSource
+                && restored.SwitchMode == state.SwitchMode
+                && restored.NextSwitchAt == state.NextSwitchAt
+                && restored.ModeRequestSeq == 7
+                && restored.ModeAppliedSeq == 6
+                && string.Join(",", restored.Categories) == "nature,city"
+                && restored.Likes.Count == 1 && restored.Likes[0].Title == "山间云海");
 
             Check("desktop menu naming", Strings.MenuNextWallpaper.Length > 0 && Strings.MenuSettings.Length > 0,
                 $"{Strings.MenuNextWallpaper} / {Strings.MenuSettings}");
@@ -633,8 +894,63 @@ internal static class SelfTest
             Check("startup state readable", exePath.Length > 0,
                 RegistryHelper.IsStartupEnabled(exePath) ? "enabled" : "disabled");
 
-            var due = MidnightScheduler.TimeUntilNextMidnight(DateTime.Now);
-            Check("next midnight within 24h", due > TimeSpan.Zero && due <= TimeSpan.FromDays(1), due.ToString());
+            var now = DateTime.Now;
+            var in30 = SwitchSchedule.NextDue(now, SwitchSchedule.Interval30);
+            Check("30 minute cycle counts from now",
+                Math.Abs((in30 - now - TimeSpan.FromMinutes(30)).TotalSeconds) < 1, in30.ToString("HH:mm:ss"));
+
+            var in6h = SwitchSchedule.NextDue(now, SwitchSchedule.Interval360);
+            Check("6 hour cycle counts from now",
+                Math.Abs((in6h - now - TimeSpan.FromHours(6)).TotalSeconds) < 1, in6h.ToString("HH:mm:ss"));
+
+            var daily = SwitchSchedule.NextDue(now, SwitchSchedule.Daily);
+            Check("daily cycle waits for the next midnight",
+                daily.Hour == 0 && daily.Minute == 0 && daily > now && daily <= now.AddDays(1),
+                daily.ToString("yyyy-MM-dd HH:mm"));
+
+            var half = SwitchSchedule.NextDue(now, SwitchSchedule.HalfDay);
+            Check("half day cycle waits for 0:00 or 12:00",
+                (half.Hour == 0 || half.Hour == 12) && half.Minute == 0 && half > now && half <= now.AddHours(13),
+                half.ToString("yyyy-MM-dd HH:mm"));
+
+            Check("unknown cycle falls back to daily", SwitchSchedule.Normalize("nonsense") == SwitchSchedule.Daily,
+                SwitchSchedule.Default);
+
+            Check("no cycling never comes due",
+                SwitchSchedule.NextDue(now, SwitchSchedule.None) == DateTime.MaxValue
+                && !SwitchSchedule.IsLooping(SwitchSchedule.None)
+                && SwitchSchedule.IsLooping(SwitchSchedule.Interval30),
+                SwitchSchedule.None);
+
+            Check("cycle pause reason",
+                SwitchSchedule.PauseReason(onBattery: true, networkDown: false, SwitchSchedule.Interval30) == SwitchSchedule.BatteryReason
+                && SwitchSchedule.PauseReason(onBattery: false, networkDown: true, SwitchSchedule.Interval30) == SwitchSchedule.NetworkReason
+                && SwitchSchedule.PauseReason(onBattery: false, networkDown: false, SwitchSchedule.None) == SwitchSchedule.FixedReason
+                && SwitchSchedule.PauseReason(onBattery: false, networkDown: true, SwitchSchedule.None) == SwitchSchedule.FixedReason
+                && SwitchSchedule.PauseReason(onBattery: false, networkDown: false, SwitchSchedule.Interval30).Length == 0,
+                $"battery>{SwitchSchedule.BatteryReason}, network>{SwitchSchedule.NetworkReason}, no cycle>{SwitchSchedule.FixedReason}");
+
+            Check("countdown format",
+                Strings.Countdown(TimeSpan.FromSeconds(740)) == (Strings.IsChinese ? "12分20秒" : "12m 20s")
+                && Strings.Countdown(TimeSpan.FromSeconds(43200)) == (Strings.IsChinese ? "12时0分0秒" : "12h 0m 0s")
+                && Strings.Countdown(TimeSpan.FromSeconds(-5)) == (Strings.IsChinese ? "0分0秒" : "0m 0s"),
+                $"{Strings.Countdown(TimeSpan.FromSeconds(740))} / {Strings.Countdown(TimeSpan.FromSeconds(43200))}");
+
+            Check("liked wallpaper chance ladder",
+                WallpaperManager.LikeChancePercent(0) == 0
+                && WallpaperManager.LikeChancePercent(5) == 10
+                && WallpaperManager.LikeChancePercent(6) == 20
+                && WallpaperManager.LikeChancePercent(19) == 20
+                && WallpaperManager.LikeChancePercent(20) == 30
+                && WallpaperManager.LikeChancePercent(49) == 30
+                && WallpaperManager.LikeChancePercent(50) == 50,
+                "1-5:10% 6-19:20% 20-49:30% 50+:50%");
+
+            Check("category selection normalised",
+                string.Join(",", Categories.Normalize(new[] { "city", "nature" })) == "nature,city"
+                && string.Join(",", Categories.Normalize(new[] { "bogus" })) == "nature"
+                && Categories.Normalize(new[] { "space" }).Count == 1,
+                string.Join(",", Categories.All));
         }
         catch (Exception ex)
         {
