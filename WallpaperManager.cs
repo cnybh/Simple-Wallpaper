@@ -75,8 +75,11 @@ internal sealed class WallpaperManager
     #region Switching
 
     /// <summary>
-    /// The desktop menu entry: applies the preloaded picture. The cycle is deliberately left alone -
-    /// a manual click must not move the next scheduled switch.
+    /// The desktop menu entry: applies the preloaded picture. An interval cycle (30 minutes, 1/2/6
+    /// hours) starts counting again from the click, so a picture the user just picked by hand is not
+    /// thrown away a moment later by a switch that was already nearly due. The two clock cycles are
+    /// left alone, because their next switch belongs to 0:00 / 12:00 and not to a moment of the
+    /// user's choosing - and a paused cycle stays paused, with only its moment moved on.
     /// </summary>
     public bool ApplyNext(out string name)
     {
@@ -103,7 +106,8 @@ internal sealed class WallpaperManager
                 }
             }
 
-            return Switch(usePending: true, reschedule: false, out name);
+            var restartCountdown = SwitchSchedule.CountsFromNow(AppState.Load().SwitchMode);
+            return Switch(usePending: true, reschedule: restartCountdown, out name);
         }
         finally
         {
@@ -145,22 +149,21 @@ internal sealed class WallpaperManager
     /// </summary>
     public void OnModeChanged(bool acOnline, bool networkDown)
     {
-        lock (_gate)
+        var state = AppState.Mutate(current =>
         {
-            var state = AppState.Load();
-            state.SwitchMode = SwitchSchedule.Normalize(state.SwitchMode);
+            current.SwitchMode = SwitchSchedule.Normalize(current.SwitchMode);
 
             // Forced: a new cycle must move the countdown even when the pause reason is unchanged,
             // which is exactly the case a plain RefreshReason would return from without rescheduling.
-            state = RefreshReason(state, acOnline, networkDown, force: true);
+            current = RefreshReason(current, acOnline, networkDown, force: true);
 
             // Only now is the settings window allowed to say the change took: its dialog waits for
             // the sequence it wrote to come back applied.
-            state.ModeAppliedSeq = state.ModeRequestSeq;
-            state.Save();
+            current.ModeAppliedSeq = current.ModeRequestSeq;
+            return current;
+        });
 
-            AppState.Log($"switch cycle is now {state.SwitchMode}; next switch {state.NextSwitchAt:yyyy-MM-dd HH:mm:ss}");
-        }
+        AppState.Log($"switch cycle is now {state.SwitchMode}; next switch {state.NextSwitchAt:yyyy-MM-dd HH:mm:ss}");
     }
 
     /// <summary>
@@ -169,6 +172,8 @@ internal sealed class WallpaperManager
     /// must not fire for the moment it was paused at, and a resumed one starts from now.
     /// <paramref name="force"/> reschedules even when the reason is unchanged, which is what a new
     /// cycle needs: two intervals share the "running" reason but not the moment they come due.
+    /// It works on the state it is given and does not write; the caller owns the whole update, so
+    /// nothing here can be saved on top of a change another process made in between.
     /// </summary>
     internal AppState RefreshReason(AppState state, bool acOnline, bool networkDown, bool log = true, bool force = false)
     {
@@ -181,7 +186,6 @@ internal sealed class WallpaperManager
                 ? DateTime.Now + NetworkCheckInterval   // when the network is asked again
                 : DateTime.MaxValue)                    // nothing is due while it stands still
             : SwitchSchedule.NextDue(DateTime.Now, state.SwitchMode);
-        state.Save();
 
         if (log) LogCycle(state);
         return state;
@@ -195,10 +199,102 @@ internal sealed class WallpaperManager
     }
 
     /// <summary>
+    /// The path of the file written while a whole switch is running. The flag itself is written in
+    /// <see cref="Switch"/>; the settings window, which runs in another process, reads it to tell
+    /// "the picture is being fetched" from "the moment has passed and nothing happened yet".
+    /// </summary>
+    internal static string SwitchingFlagPath => Path.Combine(AppState.DataDirectory, "switching.flag");
+
+    /// <summary>
+    /// The path of the file that is there while a failed switch is waiting for its retry. The waiting
+    /// is held in the state's next-switch moment, which the settings window only shows as a countdown;
+    /// this flag is what lets it say "retrying" instead, so a countdown that suddenly reads one minute
+    /// again is explained rather than mysterious.
+    /// </summary>
+    internal static string RetryFlagPath => Path.Combine(AppState.DataDirectory, "retry.flag");
+
+    /// <summary>
+    /// Records that a failed switch is waiting for its retry, or clears that record once one landed.
+    /// Both flags are only ever a hint for the settings window; nothing in the program reads them, so
+    /// a lost write can never change what the cycle does.
+    /// </summary>
+    internal static void SetRetryFlag(bool waiting)
+    {
+        var flag = RetryFlagPath;
+
+        try
+        {
+            if (waiting)
+            {
+                File.WriteAllText(flag, "retrying");
+            }
+            else if (File.Exists(flag))
+            {
+                File.Delete(flag);
+            }
+        }
+        catch (Exception ex)
+        {
+            AppState.Log($"updating the retry flag failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Drops both hint files: called once when the program starts, so nothing stale shows.</summary>
+    internal static void ClearSwitchFlags()
+    {
+        SetRetryFlag(false);
+
+        var switching = SwitchingFlagPath;
+
+        try
+        {
+            if (File.Exists(switching)) File.Delete(switching);
+        }
+        catch (Exception ex)
+        {
+            AppState.Log("removing the switching flag failed: " + ex.Message);
+        }
+    }
+
+    /// <summary>
     /// The one place a wallpaper is put on screen: decides between the freshly downloaded picture and
-    /// a liked one, stores what was applied, cleans up and refills the queue.
+    /// a liked one, stores what was applied, cleans up and refills the queue. The whole of it is what
+    /// the settings window shows "switching" for, however long the download takes - and the flag goes
+    /// away again whatever the outcome, so a stale file can never announce a switch that is over.
+    /// Whether a failed attempt is waiting for its retry is a separate hint, owned by the cycle that
+    /// schedules the retry (see <see cref="RetryFlagPath"/>).
     /// </summary>
     private bool Switch(bool usePending, bool reschedule, out string name)
+    {
+        var flag = SwitchingFlagPath;
+
+        try
+        {
+            File.WriteAllText(flag, "switching");
+        }
+        catch (Exception ex)
+        {
+            AppState.Log("writing the switching flag failed: " + ex.Message);
+        }
+
+        try
+        {
+            return ApplySwitch(usePending, reschedule, out name);
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(flag)) File.Delete(flag);
+            }
+            catch (Exception ex)
+            {
+                AppState.Log("removing the switching flag failed: " + ex.Message);
+            }
+        }
+    }
+
+    private bool ApplySwitch(bool usePending, bool reschedule, out string name)
     {
         name = string.Empty;
 
@@ -225,31 +321,36 @@ internal sealed class WallpaperManager
         {
             lock (_gate)
             {
-                var state = AppState.Load();
-
-                // Likes whose file is gone must not be counted or drawn.
-                state.Likes.RemoveAll(liked => liked.Path.Length == 0 || !File.Exists(liked.Path));
-
-                var liked = DrawLikedWallpaper(state);
-                applied = liked ?? fresh;
-
-                if (liked == null)
+                // Read, change and write as one step: the settings window stores likes in this same
+                // file, and a like must not be dropped by a switch that never saw it. The state that
+                // was written is handed back with the target, so the clean-up below judges the files
+                // by what is on disk now rather than by a snapshot from before the write.
+                (applied, var state) = AppState.Mutate(current =>
                 {
-                    ClearPending(state);
-                }
-                else
-                {
-                    // A liked picture won: the new download is not wasted, it waits for the next switch.
-                    SetPending(state, fresh);
-                }
+                    // Likes whose file is gone must not be counted or drawn.
+                    current.Likes.RemoveAll(liked => liked.Path.Length == 0 || !File.Exists(liked.Path));
 
-                state.CurrentPath = applied.Path;
-                state.CurrentTitle = applied.Title;
-                state.CurrentSource = applied.Source;
-                state.CurrentUrl = applied.Url;
+                    var liked = DrawLikedWallpaper(current);
+                    var target = liked ?? fresh;
 
-                if (reschedule) state.NextSwitchAt = SwitchSchedule.NextDue(DateTime.Now, state.SwitchMode);
-                state.Save();
+                    if (liked == null)
+                    {
+                        ClearPending(current);
+                    }
+                    else
+                    {
+                        // A liked picture won: the new download is not wasted, it waits for the next switch.
+                        SetPending(current, fresh);
+                    }
+
+                    current.CurrentPath = target.Path;
+                    current.CurrentTitle = target.Title;
+                    current.CurrentSource = target.Source;
+                    current.CurrentUrl = target.Url;
+
+                    if (reschedule) current.NextSwitchAt = SwitchSchedule.NextDue(DateTime.Now, current.SwitchMode);
+                    return (target, current);
+                });
 
                 ApplyCurrent(state);
                 RemoveOtherWallpapers(state);
@@ -364,10 +465,14 @@ internal sealed class WallpaperManager
                     return null;
                 }
 
-                var state = AppState.Load();
-                SetPending(state, target);
-                state.Save();
-                RemoveOtherWallpapers(state);
+                // The queue is written onto the state as it is now, so a like stored in the meantime
+                // survives.
+                var queued = AppState.Mutate(current =>
+                {
+                    SetPending(current, target);
+                    return current;
+                });
+                RemoveOtherWallpapers(queued);
                 AppState.Log("prefetched " + Path.GetFileName(target.Path));
             }
 
@@ -414,10 +519,12 @@ internal sealed class WallpaperManager
         string path;
         lock (_gate)
         {
-            var state = AppState.Load();
-            path = state.PendingPath;
-            ClearPending(state);
-            state.Save();
+            path = AppState.Mutate(state =>
+            {
+                var queued = state.PendingPath;
+                ClearPending(state);
+                return queued;
+            });
         }
 
         if (path.Length > 0) TryDelete(path);
@@ -493,9 +600,17 @@ internal sealed class WallpaperManager
             : null;
     }
 
+    /// <summary>
+    /// Lets the self test run a whole switch without touching the real desktop and lock screen, so a
+    /// question about the cycle's next moment cannot change what the user is looking at. Null in a
+    /// normal run.
+    /// </summary>
+    internal static bool? ApplyWallpaperForSelfTest { get; set; }
+
     private static void ApplyCurrent(AppState state)
     {
         if (state.CurrentPath.Length == 0 || !File.Exists(state.CurrentPath)) return;
+        if (ApplyWallpaperForSelfTest == false) return;
 
         RegistryHelper.ApplyDesktopWallpaper(state.CurrentPath);
 
@@ -515,7 +630,7 @@ internal sealed class WallpaperManager
         {
             Timeout = TimeSpan.FromSeconds(60),
         };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("SimpleWallpaper/1.0");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("SimpleWallpaper/1.0.1");
         return client;
     }
 
@@ -689,18 +804,20 @@ internal sealed class WallpaperManager
         RegistryHelper.DisableStartup();
         RegistryHelper.UnregisterDesktopMenu();
 
-        var state = AppState.Load();
-        state.CurrentPath = string.Empty;
-        state.CurrentTitle = string.Empty;
-        state.CurrentSource = string.Empty;
-        state.CurrentUrl = string.Empty;
-        ClearPending(state);
-        state.Likes.Clear();
-        state.Categories.Clear();
-        state.SwitchMode = SwitchSchedule.Default;
-        state.NextSwitchAt = DateTime.MinValue;
-        state.LockScreenEnabled = false;
-        state.Save();
+        AppState.Mutate(state =>
+        {
+            state.CurrentPath = string.Empty;
+            state.CurrentTitle = string.Empty;
+            state.CurrentSource = string.Empty;
+            state.CurrentUrl = string.Empty;
+            ClearPending(state);
+            state.Likes.Clear();
+            state.Categories.Clear();
+            state.SwitchMode = SwitchSchedule.Default;
+            state.NextSwitchAt = DateTime.MinValue;
+            state.LockScreenEnabled = false;
+            return true;
+        });
 
         AppState.Log("restored the Windows defaults");
     }

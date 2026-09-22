@@ -92,17 +92,57 @@ internal static class RegistryHelper
         {
             using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath);
             var value = key?.GetValue(StartupValueName) as string;
-            if (string.IsNullOrEmpty(value) || !value.Contains(exePath, StringComparison.OrdinalIgnoreCase))
-            {
-                return false;
-            }
 
-            return !IsStartupSwitchedOff();
+            // The Run value is an executable path that may also carry a command line. Comparing whole
+            // strings keeps "another program in the same folder" from passing for this one; matching
+            // on "contains" made SimpleWallpaper2.exe look like SimpleWallpaper.exe.
+            return SameProgram(value, exePath) && !IsStartupSwitchedOff();
         }
         catch (Exception ex)
         {
             AppState.Log("reading the startup entry failed: " + ex.Message);
             return false;
+        }
+    }
+
+    /// <summary>
+    /// True when a Run value starts this very program: its path is either written plainly, or quoted
+    /// with the command line following. The two paths are compared in full, case-insensitively, the
+    /// way Windows names files.
+    /// </summary>
+    private static bool SameProgram(string? runValue, string exePath)
+    {
+        if (string.IsNullOrWhiteSpace(runValue) || string.IsNullOrWhiteSpace(exePath)) return false;
+
+        var expected = NormalizePath(exePath);
+        var registered = runValue.Trim();
+
+        if (registered.StartsWith('"'))
+        {
+            var closing = registered.IndexOf('"', 1);
+            if (closing < 0) return false;
+            return NormalizePath(registered[1..closing]) == expected;
+        }
+
+        // Unquoted, the path cannot contain a space, so everything up to the first one is the program.
+        var space = registered.IndexOf(' ');
+        return NormalizePath(space < 0 ? registered : registered[..space]) == expected;
+    }
+
+    /// <summary>
+    /// One spelling for a path: environment names resolved, the rest of the path made absolute. A
+    /// path that cannot be resolved is compared as it stands, which is still exact.
+    /// </summary>
+    private static string NormalizePath(string path)
+    {
+        try
+        {
+            return Path.GetFullPath(Environment.ExpandEnvironmentVariables(path.Trim()));
+        }
+        catch (Exception ex)
+        {
+            AppState.Log("cannot normalise a path for comparison: " + ex.Message);
+            return path.Trim();
         }
     }
 

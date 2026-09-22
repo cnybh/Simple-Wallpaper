@@ -171,11 +171,14 @@ public partial class SettingsWindow : Window
 
         _modeItem = item;
 
-        var state = AppState.Load();
-        state.SwitchMode = mode;
-        state.ModeRequestSeq++;   // the number the program copies back once the new mode is saved
-        var request = state.ModeRequestSeq;
-        state.Save();
+        // The handshake number has to survive another process writing the file at the same moment,
+        // so it is counted up on the current file rather than on a snapshot.
+        var request = AppState.Mutate(state =>
+        {
+            state.SwitchMode = mode;
+            state.ModeRequestSeq++;   // the number the program copies back once the new mode is saved
+            return state.ModeRequestSeq;
+        });
         AppState.Log("switch cycle set to " + mode);
 
         // Takes effect at once: the background program recomputes the next switch from now.
@@ -294,13 +297,27 @@ public partial class SettingsWindow : Window
         }
         else if (state.PauseReason == SwitchSchedule.NetworkReason)
         {
-            NextSwitchText.Text = Strings.OfflineLabel + Strings.Countdown(state.NextSwitchAt - DateTime.Now);
+            // The check is due the moment the countdown reaches zero, and it needs a line of its own:
+            // a countdown frozen at 0分0秒 would be the one thing on screen that never moves.
+            NextSwitchText.Text = state.NextSwitchAt <= DateTime.Now
+                ? Strings.CheckingNetwork
+                : Strings.OfflineLabel + Strings.Countdown(state.NextSwitchAt - DateTime.Now);
+        }
+        else if (state.NextSwitchAt > DateTime.Now)
+        {
+            // A moment in the future is normally the next cycle. While the retry flag is up it is the
+            // retry of a failed switch instead, and saying so is what stops a countdown that suddenly
+            // reads one minute again from looking like a bug.
+            NextSwitchText.Text = File.Exists(WallpaperManager.RetryFlagPath)
+                ? Strings.RetryingSwitch + Strings.Countdown(state.NextSwitchAt - DateTime.Now)
+                : Strings.NextSwitchLabel + Strings.Countdown(state.NextSwitchAt - DateTime.Now);
         }
         else
         {
+            // The moment has passed: either the switch is running right now, or it is a poll away.
             NextSwitchText.Text = Strings.NextSwitchLabel
-                + (state.NextSwitchAt > DateTime.Now
-                    ? Strings.Countdown(state.NextSwitchAt - DateTime.Now)
+                + (File.Exists(WallpaperManager.SwitchingFlagPath)
+                    ? Strings.SwitchingNow
                     : Strings.NextSwitchDueNow);
         }
     }
@@ -499,19 +516,19 @@ public partial class SettingsWindow : Window
     /// <summary>Adds or removes the like and returns true when the picture is liked afterwards.</summary>
     private static bool ToggleLike(string path)
     {
-        var state = AppState.Load();
-        var index = state.Likes.FindIndex(liked =>
-            string.Equals(liked.Path, path, StringComparison.OrdinalIgnoreCase));
+        // Read, change and write as one step: the background program writes this file too, and a like
+        // must never be stored on top of a switch it did not see.
+        var liked = AppState.Mutate(state =>
+        {
+            var index = state.Likes.FindIndex(item =>
+                string.Equals(item.Path, path, StringComparison.OrdinalIgnoreCase));
 
-        bool liked;
-        if (index >= 0)
-        {
-            state.Likes.RemoveAt(index);
-            liked = false;
-            AppState.Log($"no longer likes {Path.GetFileName(path)}; the file goes at the next switch");
-        }
-        else
-        {
+            if (index >= 0)
+            {
+                state.Likes.RemoveAt(index);
+                return false;
+            }
+
             state.Likes.Add(new LikedWallpaper
             {
                 Path = path,
@@ -519,11 +536,12 @@ public partial class SettingsWindow : Window
                 Source = state.CurrentSource,
                 Url = state.CurrentUrl,
             });
-            liked = true;
-            AppState.Log($"likes {Path.GetFileName(path)}; the file is kept from now on");
-        }
+            return true;
+        });
 
-        state.Save();
+        AppState.Log(liked
+            ? $"likes {Path.GetFileName(path)}; the file is kept from now on"
+            : $"no longer likes {Path.GetFileName(path)}; the file goes at the next switch");
         return liked;
     }
 
@@ -571,17 +589,22 @@ public partial class SettingsWindow : Window
         }
 
         var enabled = LockScreenCheck.IsChecked == true;
-        var state = AppState.Load();
-        state.LockScreenEnabled = enabled;
-        state.Save();
+
+        // The picture in use comes from the file as it is now: the program may have switched the
+        // wallpaper since this window drew its last frame.
+        var currentPath = AppState.Mutate(state =>
+        {
+            state.LockScreenEnabled = enabled;
+            return state.CurrentPath;
+        });
 
         if (!enabled)
         {
             WallpaperManager.RestoreDefaultLockScreen();
         }
-        else if (state.CurrentPath.Length > 0 && File.Exists(state.CurrentPath))
+        else if (currentPath.Length > 0 && File.Exists(currentPath))
         {
-            WallpaperManager.ApplyLockScreen(state.CurrentPath);
+            WallpaperManager.ApplyLockScreen(currentPath);
         }
     }
 

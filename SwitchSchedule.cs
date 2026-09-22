@@ -41,6 +41,17 @@ internal static class SwitchSchedule
     /// <summary>True while the cycle moves the wallpaper by itself.</summary>
     public static bool IsLooping(string? mode) => Normalize(mode) != None;
 
+    /// <summary>
+    /// True for the cycles measured from a moment (30 minutes, 1/2/6 hours) rather than from the
+    /// clock (0:00 and 12:00). Only these can start counting again, because only they have a
+    /// beginning that "now" can replace; the clock cycles would be moved off their fixed times.
+    /// </summary>
+    public static bool CountsFromNow(string? mode) => Normalize(mode) switch
+    {
+        Interval30 or Interval60 or Interval120 or Interval360 => true,
+        _ => false,
+    };
+
     // Reasons the cycle stands still; they are also what the settings window shows instead of the
     // countdown. Battery is checked first because it is what the user asked to be told about.
     public const string BatteryReason = "battery";

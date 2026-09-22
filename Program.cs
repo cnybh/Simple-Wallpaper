@@ -73,7 +73,7 @@ internal static class Program
     /// <summary>Read on the scheduler thread only; true while the internet looked unreachable.</summary>
     private static bool _offline;
 
-    /// <summary>Tick count of the last online probe, so the ten minute gap survives a restarted tick.</summary>
+    /// <summary>Tick count of the last online probe, so a dead network is asked about ten minutes apart.</summary>
     private static long _lastNetworkCheck;
 
     [STAThread]
@@ -111,6 +111,10 @@ internal static class Program
     {
         // A second copy (for example a double logon start) has nothing to do.
         if (!AcquireInstanceMutex()) return;
+
+        // A flag left behind by a program that was killed mid-switch would keep the settings window
+        // saying "switching"/"retrying" about an attempt nobody is making.
+        WallpaperManager.ClearSwitchFlags();
 
         var exePath = Environment.ProcessPath ?? string.Empty;
         var greysOut = EnsureShellExtension(exePath);
@@ -571,49 +575,86 @@ internal static class Program
     }
 
     /// <summary>
-    /// Reads the power state and, every ten minutes, the network. The network is what a paused cycle
-    /// depends on most (it has to be asked again to know it came back), so while the program is
-    /// offline the check keeps running even though the switches do not.
+    /// Reads the power state and the network, and turns both into the reason the cycle stands still.
+    /// The network is what a paused cycle depends on most (it has to be asked again to know it came
+    /// back), so while the program is offline the check keeps running even though the switches do not.
     /// </summary>
     private static AppState RefreshCycleState(WallpaperManager wallpapers)
     {
-        if (ShouldCheckNetwork()) CheckOnline();
+        // Asked on every tick while the network looks fine - a local adapter scan, so losing it is
+        // noticed within seconds - and ten minutes apart once it is gone.
+        CheckOnline();
 
-        return wallpapers.RefreshReason(AppState.Load(), AcPowerOnline(), _offline);
+        return AppState.Mutate(state => wallpapers.RefreshReason(state, AcPowerOnline(), _offline));
     }
 
     /// <summary>
-    /// On every tick while the network looks fine - the check is a local adapter scan, and losing
-    /// the network has to be noticed within seconds - and ten minutes apart once it is gone, which
-    /// is how often a dead network is worth asking about.
+    /// Whether the network is worth asking about now. While it looks fine that is every tick: this is
+    /// a local adapter scan, and losing the network has to be noticed within seconds. Once it is gone
+    /// two answers are at least ten minutes apart - a pause that waits for the network waits for the
+    /// countdown the settings window shows, and a pause that has nothing to do with the network (a
+    /// flat battery, "no cycling") still asks every ten minutes, so the answer cannot go stale just
+    /// because the cycle is stopped for another reason.
     /// </summary>
-    private static bool ShouldCheckNetwork()
+    private static bool IsNetworkCheckDue()
     {
-        if (!_offline)
-        {
-            _lastNetworkCheck = Environment.TickCount64;
-            return true;
-        }
+        if (!_offline) return true;
 
-        return Environment.TickCount64 - _lastNetworkCheck
-            >= (long)WallpaperManager.NetworkCheckInterval.TotalMilliseconds;
+        var state = AppState.Load();
+        return state.PauseReason == SwitchSchedule.NetworkReason
+            ? DateTime.Now >= state.NextSwitchAt
+            : Environment.TickCount64 - _lastNetworkCheck
+                >= (long)WallpaperManager.NetworkCheckInterval.TotalMilliseconds;
     }
 
     /// <summary>
-    /// Asks whether the internet is reachable. Losing it and regaining it are both put in the log:
-    /// the cycle itself is carried on by <see cref="RefreshReason"/>, which turns the answer into
-    /// the state the settings window shows.
+    /// Writes down the wait until the network is worth asking about again, which is also what the
+    /// settings window counts down. Doing it whenever the check came back offline is what stops the
+    /// countdown from sitting at zero: the next check always has its own ten minutes ahead of it.
+    /// </summary>
+    private static void EnsureNetworkCheckInterval()
+    {
+        AppState.Mutate(state =>
+        {
+            state.NextSwitchAt = DateTime.Now + WallpaperManager.NetworkCheckInterval;
+            return true;
+        });
+    }
+
+    /// <summary>
+    /// Asks whether the internet is reachable. Losing it and regaining it are both put in the log, and
+    /// both are carried into the state the settings window reads: coming back empty handed writes the
+    /// next ten minute wait down at once, which is what keeps the countdown off zero, while coming
+    /// back with an answer lets <see cref="WallpaperManager.RefreshReason"/> resume the cycle.
     /// </summary>
     private static void CheckOnline()
     {
-        var reachable = HasInternetConnection();
-        if (reachable == !_offline) return;
+        if (!IsNetworkCheckDue()) return;
 
-        _offline = !reachable;
-        AppState.Log(reachable
-            ? "network became reachable again"
-            : "network is unreachable; checking again every ten minutes");
+        // Asked now, so the ten minute gap counts from this answer.
+        _lastNetworkCheck = Environment.TickCount64;
+
+        var reachable = (HasInternetConnectionForSelfTest ?? HasInternetConnection)();
+        if (reachable != !_offline)
+        {
+            _offline = !reachable;
+            AppState.Log(reachable
+                ? "network became reachable again"
+                : "network is unreachable; checking again every ten minutes");
+        }
+
+        // Whether it just went away or was still away: the next check gets its own ten minutes, which
+        // is what keeps the countdown the settings window shows off zero.
+        if (!reachable) EnsureNetworkCheckInterval();
     }
+
+    /// <summary>The internet probe and the reachability the self test drives by hand.</summary>
+    internal static Func<bool>? HasInternetConnectionForSelfTest { get; set; }
+
+    /// <summary>The self test's handle on the scheduler tick it has to move by hand.</summary>
+    internal static Action<WallpaperManager> ScheduleTick => EvaluateSchedule;
+
+    internal static bool OfflineFlag { get => _offline; set => _offline = value; }
 
     /// <summary>
     /// Whether an adapter that can actually reach the internet is up. NetworkInterface's own
@@ -719,6 +760,7 @@ internal static class Program
             {
                 Volatile.Write(ref _retryAttempt, 0);
                 Volatile.Write(ref _awaitingRetry, 0);
+                WallpaperManager.SetRetryFlag(false);
                 return true;
             }
 
@@ -728,11 +770,14 @@ internal static class Program
                 var delay = RetryBackoff[Math.Min(attempt, RetryBackoff.Length - 1)];
                 _retryAttempt = attempt + 1;
 
-                var state = AppState.Load();
-                state.NextSwitchAt = DateTime.Now + delay;
-                state.Save();
+                AppState.Mutate(state =>
+                {
+                    state.NextSwitchAt = DateTime.Now + delay;
+                    return true;
+                });
 
                 Volatile.Write(ref _awaitingRetry, 1);
+                WallpaperManager.SetRetryFlag(true);   // the countdown below counts to a retry, not a cycle
                 AppState.Log($"switch attempt failed; retry #{attempt + 1} in {delay.TotalMinutes:0} minute(s)");
             }
 
@@ -848,6 +893,10 @@ internal static class SelfTest
 
         try
         {
+            // A real manager, so the flow below drives the same object the program uses. Its own
+            // prefetch never keeps a thread alive; the watcher is not started here.
+            var wallpapers = new WallpaperManager();
+
             var (width, height) = DisplayHelper.GetPrimaryResolution();
             Check("primary resolution detected", width > 0 && height > 0, $"{width}x{height}");
 
@@ -936,6 +985,14 @@ internal static class SelfTest
                 && Strings.Countdown(TimeSpan.FromSeconds(-5)) == (Strings.IsChinese ? "0分0秒" : "0m 0s"),
                 $"{Strings.Countdown(TimeSpan.FromSeconds(740))} / {Strings.Countdown(TimeSpan.FromSeconds(43200))}");
 
+            // Checked in whichever language this run uses, so the words that end up on screen are the
+            // ones actually in the build being tested.
+            Check("battery pause line",
+                Strings.BatteryPaused == (Strings.IsChinese
+                    ? "电池模式停用自动切换以节省电量"
+                    : "Battery mode: automatic switching is OFF"),
+                Strings.BatteryPaused);
+
             Check("liked wallpaper chance ladder",
                 WallpaperManager.LikeChancePercent(0) == 0
                 && WallpaperManager.LikeChancePercent(5) == 10
@@ -951,6 +1008,10 @@ internal static class SelfTest
                 && string.Join(",", Categories.Normalize(new[] { "bogus" })) == "nature"
                 && Categories.Normalize(new[] { "space" }).Count == 1,
                 string.Join(",", Categories.All));
+
+            CheckNetworkCheckFlow(Check, wallpapers);
+            CheckStateUpdatesAreAtomic(Check);
+            CheckManualSwitchRestartsInterval(Check, wallpapers);
         }
         catch (Exception ex)
         {
@@ -972,6 +1033,235 @@ internal static class SelfTest
         }
 
         return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Drives the network part of the cycle by hand: a wait that has run out must ask again, and the
+    /// countdown must start over when the answer is still "no", so that the settings window never
+    /// shows a countdown frozen at zero. The whole flow runs against a throwaway folder, so the state
+    /// of a program that is running at the same time is left untouched.
+    /// </summary>
+    private static void CheckNetworkCheckFlow(Action<string, bool, string> check, WallpaperManager wallpapers)
+    {
+        var folder = Path.Combine(Path.GetTempPath(), "SimpleWallpaperSelfTest-" + Guid.NewGuid().ToString("N"));
+        var wasOffline = Program.OfflineFlag;
+
+        try
+        {
+            AppState.DataDirectoryForSelfTest = folder;
+
+            AppState.Mutate(state =>
+            {
+                state.SwitchMode = SwitchSchedule.Interval30;
+                state.PauseReason = SwitchSchedule.NetworkReason;
+                state.NextSwitchAt = DateTime.Now.AddSeconds(-1);   // the countdown has just run out
+                return true;
+            });
+
+            Program.HasInternetConnectionForSelfTest = () => false;
+            Program.OfflineFlag = true;
+            Program.ScheduleTick(wallpapers);
+
+            var stillOffline = AppState.Load();
+            check("no network: the wait starts over instead of sticking at zero",
+                stillOffline.PauseReason == SwitchSchedule.NetworkReason
+                && stillOffline.NextSwitchAt > DateTime.Now.AddMinutes(9)
+                && stillOffline.NextSwitchAt <= DateTime.Now.AddMinutes(11),
+                $"next check in {Strings.Countdown(stillOffline.NextSwitchAt - DateTime.Now)}");
+
+            // The line the settings window shows for that state: the wait is counting towards the
+            // next check, and the moment it is over is read as "checking" instead of as a zero.
+            check("no network: the line counts to the next check and then says checking",
+                stillOffline.NextSwitchAt > DateTime.Now
+                && Strings.CheckingNetwork.Length > 0,
+                $"{Strings.OfflineLabel}{Strings.Countdown(stillOffline.NextSwitchAt - DateTime.Now)}"
+                + $" / {Strings.CheckingNetwork}");
+
+            // The check is due again: with the network back, the cycle has to resume from now.
+            Program.HasInternetConnectionForSelfTest = () => true;
+            stillOffline = AppState.Mutate(state =>
+            {
+                state.NextSwitchAt = DateTime.Now.AddSeconds(-1);
+                return state;
+            });
+            Program.ScheduleTick(wallpapers);
+
+            var backOnline = AppState.Load();
+            check("network back: the cycle resumes from now",
+                backOnline.PauseReason.Length == 0
+                && backOnline.NextSwitchAt > DateTime.Now.AddMinutes(29)
+                && backOnline.NextSwitchAt <= DateTime.Now.AddMinutes(31),
+                $"next switch in {Strings.Countdown(backOnline.NextSwitchAt - DateTime.Now)}");
+        }
+        catch (Exception ex)
+        {
+            check("network check flow", false, ex.Message);
+        }
+        finally
+        {
+            Program.HasInternetConnectionForSelfTest = null;
+            AppState.DataDirectoryForSelfTest = null;
+            Program.OfflineFlag = wasOffline;
+
+            try
+            {
+                if (Directory.Exists(folder)) Directory.Delete(folder, true);
+            }
+            catch (Exception ex)
+            {
+                AppState.Log("removing the self test folder failed: " + ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Shows that two writers cannot lose each other's work: every concurrent update must survive.
+    /// It runs against a throwaway folder, and it is the check that fails if a caller ever goes back
+    /// to "read a snapshot, change it, write it back".
+    /// </summary>
+    private static void CheckStateUpdatesAreAtomic(Action<string, bool, string> check)
+    {
+        var folder = Path.Combine(Path.GetTempPath(), "SimpleWallpaperSelfTest-" + Guid.NewGuid().ToString("N"));
+
+        try
+        {
+            AppState.DataDirectoryForSelfTest = folder;
+
+            const int writers = 8;
+            const int updatesEach = 20;
+
+            var threads = new List<Thread>();
+            for (var writer = 0; writer < writers; writer++)
+            {
+                var thread = new Thread(() =>
+                {
+                    for (var i = 0; i < updatesEach; i++)
+                    {
+                        AppState.Mutate(state =>
+                        {
+                            state.ModeRequestSeq++;
+                            return true;
+                        });
+                    }
+                })
+                {
+                    IsBackground = true,
+                };
+
+                threads.Add(thread);
+            }
+
+            foreach (var thread in threads) thread.Start();
+            foreach (var thread in threads) thread.Join();
+
+            var kept = AppState.Load().ModeRequestSeq;
+            check("concurrent state updates all survive",
+                kept == writers * updatesEach,
+                $"{kept} of {writers * updatesEach} updates kept");
+        }
+        catch (Exception ex)
+        {
+            check("concurrent state updates", false, ex.Message);
+        }
+        finally
+        {
+            AppState.DataDirectoryForSelfTest = null;
+
+            try
+            {
+                if (Directory.Exists(folder)) Directory.Delete(folder, true);
+            }
+            catch (Exception ex)
+            {
+                AppState.Log("removing the self test folder failed: " + ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A click on "next wallpaper" must start an interval cycle over, so the picture the user just
+    /// chose is not replaced a moment later by a switch that was already nearly due - while the two
+    /// clock cycles keep their fixed 0:00 / 12:00 moment. It drives the real command against a
+    /// throwaway folder, with the wallpaper itself left alone (see ApplyWallpaperForSelfTest), so
+    /// asking the question cannot change what is on the desktop.
+    /// </summary>
+    private static void CheckManualSwitchRestartsInterval(Action<string, bool, string> check, WallpaperManager wallpapers)
+    {
+        var folder = Path.Combine(Path.GetTempPath(), "SimpleWallpaperSelfTest-" + Guid.NewGuid().ToString("N"));
+        var picture = Path.Combine(folder, "queued.jpg");
+
+        try
+        {
+            Directory.CreateDirectory(folder);
+            File.WriteAllBytes(picture, new byte[4096]);
+            AppState.DataDirectoryForSelfTest = folder;
+            WallpaperManager.ApplyWallpaperForSelfTest = false;   // the desktop itself stays untouched
+
+            // The interval cycles all count from the click.
+            RestartsCountdown(check, wallpapers, SwitchSchedule.Interval30, TimeSpan.FromMinutes(30), picture, restarts: true);
+            RestartsCountdown(check, wallpapers, SwitchSchedule.Interval60, TimeSpan.FromHours(1), picture, restarts: true);
+            RestartsCountdown(check, wallpapers, SwitchSchedule.Interval120, TimeSpan.FromHours(2), picture, restarts: true);
+            RestartsCountdown(check, wallpapers, SwitchSchedule.Interval360, TimeSpan.FromHours(6), picture, restarts: true);
+
+            // The clock cycles keep their moment: it belongs to 0:00 / 12:00, not to a click.
+            RestartsCountdown(check, wallpapers, SwitchSchedule.HalfDay, TimeSpan.FromMinutes(5), picture, restarts: false);
+            RestartsCountdown(check, wallpapers, SwitchSchedule.Daily, TimeSpan.FromMinutes(5), picture, restarts: false);
+        }
+        catch (Exception ex)
+        {
+            check("manual switch restarts the countdown", false, ex.Message);
+        }
+        finally
+        {
+            WallpaperManager.ApplyWallpaperForSelfTest = null;
+            AppState.DataDirectoryForSelfTest = null;
+
+            try
+            {
+                if (Directory.Exists(folder)) Directory.Delete(folder, true);
+            }
+            catch (Exception ex)
+            {
+                AppState.Log("removing the self test folder failed: " + ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// One cycle tried on its own: the next switch is put five minutes away, a manual switch is run,
+    /// and the moment afterwards has to be either "now + the cycle" or exactly the moment from before.
+    /// </summary>
+    private static void RestartsCountdown(Action<string, bool, string> check, WallpaperManager wallpapers,
+        string mode, TimeSpan interval, string picture, bool restarts)
+    {
+        var soon = DateTime.Now.AddMinutes(5);
+        AppState.Mutate(state =>
+        {
+            state.SwitchMode = mode;
+            state.PauseReason = string.Empty;
+            state.NextSwitchAt = soon;
+            state.CurrentPath = string.Empty;
+            state.PendingPath = picture;
+            state.PendingTitle = string.Empty;
+            state.PendingSource = string.Empty;
+            state.PendingUrl = string.Empty;
+            return true;
+        });
+
+        var applied = wallpapers.ApplyNext(out _);
+        var next = AppState.Load().NextSwitchAt;
+        var away = next - DateTime.Now;
+
+        var ok = applied
+            && (restarts
+                ? away > interval - TimeSpan.FromSeconds(10) && away <= interval + TimeSpan.FromSeconds(10)
+                : next == soon);
+
+        check($"manual switch on {mode}: countdown {(restarts ? "starts over" : "stays put")}",
+            ok,
+            restarts
+                ? $"{Strings.Countdown(away)} until the next switch"
+                : $"next switch kept at {soon:HH:mm:ss}");
     }
 
     [DllImport("kernel32.dll")]

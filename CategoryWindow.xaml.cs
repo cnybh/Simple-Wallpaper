@@ -48,9 +48,11 @@ public partial class CategoryWindow : Window
             return;
         }
 
-        var state = AppState.Load();
-        state.Categories = picked;
-        state.Save();
+        AppState.Mutate(state =>
+        {
+            state.Categories = picked;
+            return true;
+        });
         AppState.Log("wallpaper categories set to " + string.Join(",", picked));
 
         // The background program owns the download; the settings window waits for the new picture.

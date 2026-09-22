@@ -11,7 +11,7 @@
     <AssemblyTitle>Simple Wallpaper</AssemblyTitle>
     <Product>Simple Wallpaper</Product>
     <Company>Bohang</Company>
-    <Version>1.0.0</Version>
+    <Version>1.0.1</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>logo2.ico</ApplicationIcon>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>

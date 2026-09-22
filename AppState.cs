@@ -54,8 +54,25 @@ internal sealed class AppState
     private static readonly object Gate = new();
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    public static string DataDirectory => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Wallpaper");
+    /// <summary>
+    /// Guards state.json across processes. The background program, the settings window and a click
+    /// that restarts the program all read and write this one file; without a lock two of them write
+    /// back a snapshot they read moments ago, and the later write throws the other's change away
+    /// (a like being stored while the switch lands, for example). A named mutex is the same object in
+    /// every process of the session, and Windows releases it even if its owner dies.
+    /// </summary>
+    private static readonly Mutex StateFileMutex = new(false, @"Local\SimpleWallpaperState");
+
+    /// <summary>
+    /// The folder everything is kept in. A normal run never sets the override; the self test uses it
+    /// to write the state and the log to a throwaway folder, so its screens cannot touch the state of
+    /// a program that is running while it asks its questions.
+    /// </summary>
+    internal static string? DataDirectoryForSelfTest { get; set; }
+
+    public static string DataDirectory =>
+        DataDirectoryForSelfTest ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Wallpaper");
 
     public static string StateFilePath => Path.Combine(DataDirectory, "state.json");
     public static string ErrorLogPath => Path.Combine(DataDirectory, "error.log");
@@ -84,38 +101,7 @@ internal sealed class AppState
     {
         lock (Gate)
         {
-            try
-            {
-                if (File.Exists(StateFilePath))
-                {
-                    var state = JsonSerializer.Deserialize<AppState>(File.ReadAllText(StateFilePath));
-                    if (state != null) return state;
-                }
-            }
-            catch (Exception ex)
-            {
-                Log("failed to read state.json: " + ex.Message);
-            }
-
-            return new AppState();
-        }
-    }
-
-    public void Save()
-    {
-        lock (Gate)
-        {
-            try
-            {
-                Directory.CreateDirectory(DataDirectory);
-                var temp = StateFilePath + ".tmp";
-                File.WriteAllText(temp, JsonSerializer.Serialize(this, JsonOptions), Encoding.UTF8);
-                File.Move(temp, StateFilePath, true);
-            }
-            catch (Exception ex)
-            {
-                Log("failed to write state.json: " + ex.Message);
-            }
+            return ReadStateFile();
         }
     }
 
@@ -135,6 +121,66 @@ internal sealed class AppState
             }
         }
     }
+
+    /// <summary>
+    /// The only way to change the state: reads the file as it is right now, lets
+    /// <paramref name="change"/> alter that copy, and writes it back while no other process can write.
+    /// Callers must not hold a snapshot from earlier and save it afterwards - that is exactly the
+    /// overwrite this replaces. File and registry work is deliberately left outside <paramref name="change"/>,
+    /// so the lock is never held for anything slow.
+    /// </summary>
+    public static T Mutate<T>(Func<AppState, T> change)
+    {
+        lock (Gate)
+        {
+            StateFileMutex.WaitOne();
+
+            try
+            {
+                var state = ReadStateFile();
+                var result = change(state);
+                WriteStateFile(state);
+                return result;
+            }
+            finally
+            {
+                StateFileMutex.ReleaseMutex();
+            }
+        }
+    }
+
+    private static AppState ReadStateFile()
+    {
+        try
+        {
+            if (File.Exists(StateFilePath))
+            {
+                var state = JsonSerializer.Deserialize<AppState>(File.ReadAllText(StateFilePath));
+                if (state != null) return state;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log("failed to read state.json: " + ex.Message);
+        }
+
+        return new AppState();
+    }
+
+    private static void WriteStateFile(AppState state)
+    {
+        try
+        {
+            Directory.CreateDirectory(DataDirectory);
+            var temp = StateFilePath + ".tmp";
+            File.WriteAllText(temp, JsonSerializer.Serialize(state, JsonOptions), Encoding.UTF8);
+            File.Move(temp, StateFilePath, true);
+        }
+        catch (Exception ex)
+        {
+            Log("failed to write state.json: " + ex.Message);
+        }
+    }
 }
 
 /// <summary>One wallpaper the user liked. The file is kept on disk and used as a switch target.</summary>
@@ -144,5 +190,4 @@ internal sealed class LikedWallpaper
     [JsonPropertyName("title")] public string Title { get; set; } = string.Empty;
     [JsonPropertyName("source")] public string Source { get; set; } = string.Empty;
     [JsonPropertyName("url")] public string Url { get; set; } = string.Empty;
-    [JsonPropertyName("liked_at")] public DateTime LikedAt { get; set; } = DateTime.Now;
 }

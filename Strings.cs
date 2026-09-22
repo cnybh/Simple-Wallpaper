@@ -61,16 +61,25 @@ internal static class Strings
     /// <summary>Left of the label while the moment counted towards has already passed.</summary>
     public static string NextSwitchDueNow => Chinese ? "即将切换" : "any moment now";
 
+    /// <summary>Shown in its place while the switch itself is running: the download takes as long as it takes.</summary>
+    public static string SwitchingNow => Chinese ? "正在切换壁纸…" : "Switching the wallpaper…";
+
+    /// <summary>Shown while a failed switch counts down to its retry, so that moment is explained.</summary>
+    public static string RetryingSwitch => Chinese ? "切换失败，稍后重试" : "Switch failed; retrying shortly";
+
     /// <summary>Shown instead of the countdown while the cycle never loops: the picture just stays.</summary>
     public static string FixedWallpaper => Chinese ? "固定壁纸" : "Fixed wallpaper";
 
     /// <summary>Shown while the cycle is stopped to save power.</summary>
     public static string BatteryPaused => Chinese
         ? "电池模式停用自动切换以节省电量"
-        : "Battery mode: automatic switching is off to save power";
+        : "Battery mode: automatic switching is OFF";
 
     /// <summary>"无网络，下次检测时间：" - the countdown to the next network check follows it.</summary>
     public static string OfflineLabel => Chinese ? "无网络，下次检测时间：" : "No network, next check in ";
+
+    /// <summary>Stands where the offline countdown does once it has run out: the check is on.</summary>
+    public static string CheckingNetwork => Chinese ? "检测中" : "Checking";
 
     /// <summary>
     /// A span of time, in seconds. Hours come first and are left out when there are none, so a
