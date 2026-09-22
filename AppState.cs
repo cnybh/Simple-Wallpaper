@@ -37,6 +37,16 @@ internal sealed class AppState
     [JsonPropertyName("next_switch_at")] public DateTime NextSwitchAt { get; set; } = DateTime.MinValue;
 
     /// <summary>
+    /// The wait an interval cycle (30 minutes, 1/2/6 hours) still had in front of it when a flat
+    /// battery or a dead network paused it (see <see cref="WallpaperManager.RefreshReason"/>). Such a
+    /// pause does not run that wait down, so resuming waits exactly this long again: ten minutes off
+    /// the mains or off the network are not taken off it. A clock cycle ("按上/下午", "按日期每天")
+    /// has no wait to keep - it stays on its 0:00 / 12:00 anchor - so this is left at zero for those.
+    /// <see cref="TimeSpan.Zero"/> means nothing is held.
+    /// </summary>
+    [JsonPropertyName("paused_remaining")] public TimeSpan PausedRemaining { get; set; } = TimeSpan.Zero;
+
+    /// <summary>
     /// Why the cycle stands still (see <see cref="SwitchSchedule.PauseReason"/>), empty while it runs.
     /// It lives in the state so a restart keeps showing flat battery or no network instead of a
     /// countdown that nothing is counting down to.

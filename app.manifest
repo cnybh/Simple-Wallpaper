@@ -2,7 +2,7 @@
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
   <!-- The identity version follows the assembly version, so the two ways of asking "which build is
        this" cannot disagree. -->
-  <assemblyIdentity version="1.0.1.0" name="SimpleWallpaper.app" />
+  <assemblyIdentity version="1.0.2.0" name="SimpleWallpaper.app" />
 
   <!-- Runs with the caller's token (no UAC prompt ever).
        Everything this program does is per-user: the desktop wallpaper, the lock screen image,

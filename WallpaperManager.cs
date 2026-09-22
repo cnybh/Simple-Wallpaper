@@ -157,6 +157,11 @@ internal sealed class WallpaperManager
             // which is exactly the case a plain RefreshReason would return from without rescheduling.
             current = RefreshReason(current, acOnline, networkDown, force: true);
 
+            // A pause that survived the change holds no wait: the new cycle's length is what it would
+            // run for, and the wait the cycle the user replaced had left is not that length. The next
+            // resume then counts the new cycle out from its start.
+            if (current.PauseReason.Length > 0) current.PausedRemaining = TimeSpan.Zero;
+
             // Only now is the settings window allowed to say the change took: its dialog waits for
             // the sequence it wrote to come back applied.
             current.ModeAppliedSeq = current.ModeRequestSeq;
@@ -168,8 +173,21 @@ internal sealed class WallpaperManager
 
     /// <summary>
     /// Turns "flat battery / no network / the user picked no cycle" into the reason the settings
-    /// window shows, and recomputes the next switch whenever the reason changes - a paused cycle
-    /// must not fire for the moment it was paused at, and a resumed one starts from now.
+    /// window shows, and keeps the switch moment right through the pause.
+    ///
+    /// The two kinds of cycle are treated differently, which is the whole point of
+    /// <see cref="SwitchSchedule.CountsFromNow"/>:
+    ///
+    /// * An interval (30 minutes, 1/2/6 hours) counts a wait down. A pause puts that wait - what the
+    ///   cycle still had in front of it - into <see cref="AppState.PausedRemaining"/>, and resuming
+    ///   waits it out from that moment. Ten minutes off the mains or off the network therefore cost
+    ///   the cycle nothing: 26 minutes left before the pause are 26 minutes left after it.
+    /// * A clock cycle ("按上/下午", "按日期每天") belongs to 0:00 / 12:00 and does not count anything
+    ///   down. Its pause only stops the switching, not the clock, so the moment stays the next anchor
+    ///   and is recomputed on every resume: an anchor that passed while the cycle stood still is gone,
+    ///   and the cycle waits for the next one instead of switching late.
+    ///
+    /// Only a new cycle starts over, because its length (or its anchor) is what the user just changed.
     /// <paramref name="force"/> reschedules even when the reason is unchanged, which is what a new
     /// cycle needs: two intervals share the "running" reason but not the moment they come due.
     /// It works on the state it is given and does not write; the caller owns the whole update, so
@@ -180,12 +198,37 @@ internal sealed class WallpaperManager
         var reason = SwitchSchedule.PauseReason(!acOnline, networkDown, state.SwitchMode);
         if (reason == state.PauseReason && !force) return state;
 
+        var countsFromNow = SwitchSchedule.CountsFromNow(state.SwitchMode);
         state.PauseReason = reason;
-        state.NextSwitchAt = reason.Length > 0
-            ? (reason == SwitchSchedule.NetworkReason
+
+        if (reason.Length > 0)
+        {
+            // Going on hold. An interval has a wait worth keeping, and never a negative one - a cycle
+            // whose moment has already passed owes a switch rather than a wait. A clock cycle has no
+            // wait to keep: its moment is an anchor the pause does not move.
+            if (countsFromNow && state.PausedRemaining <= TimeSpan.Zero && state.NextSwitchAt != DateTime.MaxValue)
+            {
+                var wait = state.NextSwitchAt - DateTime.Now;
+                state.PausedRemaining = wait > TimeSpan.Zero ? wait : TimeSpan.Zero;
+            }
+
+            state.NextSwitchAt = reason == SwitchSchedule.NetworkReason
                 ? DateTime.Now + NetworkCheckInterval   // when the network is asked again
-                : DateTime.MaxValue)                    // nothing is due while it stands still
-            : SwitchSchedule.NextDue(DateTime.Now, state.SwitchMode);
+                : DateTime.MaxValue;                    // nothing is due while it stands still
+        }
+        else
+        {
+            // Running again. An interval waits out the time it had left, so the pause - however long
+            // it lasted - is simply missing from its countdown. A clock cycle is recomputed to its
+            // next anchor, which skips one that passed while the cycle stood still. Nothing set aside
+            // means no interval was ever waiting (a first run, or one that went "no cycle"): that one
+            // starts a whole cycle from now.
+            var wait = state.PausedRemaining;
+            state.PausedRemaining = TimeSpan.Zero;
+            state.NextSwitchAt = countsFromNow && wait > TimeSpan.Zero
+                ? DateTime.Now + wait
+                : SwitchSchedule.NextDue(DateTime.Now, state.SwitchMode);
+        }
 
         if (log) LogCycle(state);
         return state;
@@ -630,7 +673,7 @@ internal sealed class WallpaperManager
         {
             Timeout = TimeSpan.FromSeconds(60),
         };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("SimpleWallpaper/1.0.1");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("SimpleWallpaper/1.0.2");
         return client;
     }
 
@@ -815,6 +858,7 @@ internal sealed class WallpaperManager
             state.Categories.Clear();
             state.SwitchMode = SwitchSchedule.Default;
             state.NextSwitchAt = DateTime.MinValue;
+            state.PausedRemaining = TimeSpan.Zero;
             state.LockScreenEnabled = false;
             return true;
         });

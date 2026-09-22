@@ -611,12 +611,19 @@ internal static class Program
     /// Writes down the wait until the network is worth asking about again, which is also what the
     /// settings window counts down. Doing it whenever the check came back offline is what stops the
     /// countdown from sitting at zero: the next check always has its own ten minutes ahead of it.
+    /// While the cycle stands still for another reason (a flat battery) nothing is written: that
+    /// moment is not the countdown the settings window shows then, and the switch the cycle is
+    /// holding must not be overwritten by a check that has nothing to do with it.
     /// </summary>
     private static void EnsureNetworkCheckInterval()
     {
         AppState.Mutate(state =>
         {
-            state.NextSwitchAt = DateTime.Now + WallpaperManager.NetworkCheckInterval;
+            if (state.PauseReason.Length == 0 || state.PauseReason == SwitchSchedule.NetworkReason)
+            {
+                state.NextSwitchAt = DateTime.Now + WallpaperManager.NetworkCheckInterval;
+            }
+
             return true;
         });
     }
@@ -1010,6 +1017,7 @@ internal static class SelfTest
                 string.Join(",", Categories.All));
 
             CheckNetworkCheckFlow(Check, wallpapers);
+            CheckPauseKeepsRemainingTime(Check, wallpapers);
             CheckStateUpdatesAreAtomic(Check);
             CheckManualSwitchRestartsInterval(Check, wallpapers);
         }
@@ -1054,7 +1062,10 @@ internal static class SelfTest
             {
                 state.SwitchMode = SwitchSchedule.Interval30;
                 state.PauseReason = SwitchSchedule.NetworkReason;
-                state.NextSwitchAt = DateTime.Now.AddSeconds(-1);   // the countdown has just run out
+                state.NextSwitchAt = DateTime.Now.AddSeconds(-1);   // the network check has run out
+                // Twenty minutes of the 30 minute cycle were still to go when the network went away.
+                // A pause does not run that wait down, so it is simply handed to the scheduler here.
+                state.PausedRemaining = TimeSpan.FromMinutes(20);
                 return true;
             });
 
@@ -1077,21 +1088,30 @@ internal static class SelfTest
                 $"{Strings.OfflineLabel}{Strings.Countdown(stillOffline.NextSwitchAt - DateTime.Now)}"
                 + $" / {Strings.CheckingNetwork}");
 
-            // The check is due again: with the network back, the cycle has to resume from now.
+            // The switch moment the cycle was holding: 20 minutes of a 30 minute cycle still to go.
+            var dueWhenOffline = AppState.Load().PausedRemaining;
+            check("no network: what the cycle had left is set aside",
+                dueWhenOffline > TimeSpan.FromMinutes(19) && dueWhenOffline <= TimeSpan.FromMinutes(20),
+                $"{Strings.Countdown(dueWhenOffline)} left of the cycle, waiting");
+
+            // The check is due again and this time it comes back with an answer: the cycle carries on
+            // with the wait it had left instead of starting its whole cycle over.
             Program.HasInternetConnectionForSelfTest = () => true;
-            stillOffline = AppState.Mutate(state =>
+            AppState.Mutate(state =>
             {
-                state.NextSwitchAt = DateTime.Now.AddSeconds(-1);
-                return state;
+                state.NextSwitchAt = DateTime.Now.AddSeconds(-1);   // the check is due again
+                return true;
             });
             Program.ScheduleTick(wallpapers);
 
             var backOnline = AppState.Load();
-            check("network back: the cycle resumes from now",
+            var leftWhenBack = backOnline.NextSwitchAt - DateTime.Now;
+            check("network back: the cycle keeps the time it had left",
                 backOnline.PauseReason.Length == 0
-                && backOnline.NextSwitchAt > DateTime.Now.AddMinutes(29)
-                && backOnline.NextSwitchAt <= DateTime.Now.AddMinutes(31),
-                $"next switch in {Strings.Countdown(backOnline.NextSwitchAt - DateTime.Now)}");
+                && backOnline.PausedRemaining == TimeSpan.Zero
+                && leftWhenBack > dueWhenOffline - TimeSpan.FromSeconds(2)
+                && leftWhenBack <= dueWhenOffline,
+                $"resumed with {Strings.Countdown(leftWhenBack)} left of the 30 minute cycle");
         }
         catch (Exception ex)
         {
@@ -1102,6 +1122,191 @@ internal static class SelfTest
             Program.HasInternetConnectionForSelfTest = null;
             AppState.DataDirectoryForSelfTest = null;
             Program.OfflineFlag = wasOffline;
+
+            try
+            {
+                if (Directory.Exists(folder)) Directory.Delete(folder, true);
+            }
+            catch (Exception ex)
+            {
+                AppState.Log("removing the self test folder failed: " + ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Shows that a flat battery or a dead network costs the cycle no time: the wait the cycle still
+    /// had is put aside while it stands still, and resuming waits that same time out again instead of
+    /// starting the whole cycle over. The calls below are the scheduler's own - the same
+    /// <see cref="WallpaperManager.RefreshReason"/> it runs on every tick - so this is exactly the
+    /// path a real "off the mains for ten minutes, then back on" takes.
+    /// </summary>
+    private static void CheckPauseKeepsRemainingTime(Action<string, bool, string> check, WallpaperManager wallpapers)
+    {
+        // The case the user asked about: 26 minutes to go when the battery mode starts.
+        var pauseStarted = DateTime.Now;
+        var state = new AppState
+        {
+            SwitchMode = SwitchSchedule.Interval30,
+            NextSwitchAt = pauseStarted.AddMinutes(26),
+        };
+
+        wallpapers.RefreshReason(state, acOnline: false, networkDown: false);   // battery mode starts
+        var pausedAt = DateTime.Now;
+
+        check("battery pause sets aside the wait the cycle had left",
+            state.PauseReason == SwitchSchedule.BatteryReason
+            && state.PausedRemaining > TimeSpan.FromMinutes(25)
+            && state.PausedRemaining <= TimeSpan.FromMinutes(26)
+            && state.NextSwitchAt == DateTime.MaxValue,
+            $"{Strings.Countdown(state.PausedRemaining)} set aside");
+
+        // Ten minutes pass in battery mode: nothing is counted down by them.
+        var whilePaused = wallpapers.RefreshReason(state, acOnline: false, networkDown: false);
+        check("ten minutes of battery mode do not run the wait down",
+            whilePaused.PausedRemaining == state.PausedRemaining,
+            $"{Strings.Countdown(whilePaused.PausedRemaining)} still set aside");
+
+        // The mains are back: the wait starts over from now, so 26 - not 36 - minutes are left.
+        wallpapers.RefreshReason(state, acOnline: true, networkDown: false);
+        var leftAfterBattery = state.NextSwitchAt - pausedAt;
+
+        check("26 minutes left, a pause, then 26 minutes left again",
+            state.PauseReason.Length == 0
+            && state.PausedRemaining == TimeSpan.Zero
+            && leftAfterBattery > TimeSpan.FromMinutes(26) - TimeSpan.FromSeconds(3) && leftAfterBattery <= TimeSpan.FromMinutes(26) + TimeSpan.FromSeconds(3),
+            $"{Strings.Countdown(leftAfterBattery)} left after the pause, not 36m");
+
+        // The same through a dead network, which is the other reason the cycle stands still.
+        var offline = new AppState
+        {
+            SwitchMode = SwitchSchedule.Interval30,
+            NextSwitchAt = DateTime.Now.AddMinutes(26),
+        };
+        wallpapers.RefreshReason(offline, acOnline: true, networkDown: true);
+        var offlineAt = DateTime.Now;
+
+        check("network pause sets aside the wait the cycle had left",
+            offline.PauseReason == SwitchSchedule.NetworkReason
+            && offline.PausedRemaining > TimeSpan.FromMinutes(25)
+            && offline.PausedRemaining <= TimeSpan.FromMinutes(26)
+            && offline.NextSwitchAt > DateTime.Now.AddMinutes(9)
+            && offline.NextSwitchAt <= DateTime.Now.AddMinutes(11),
+            $"{Strings.Countdown(offline.PausedRemaining)} set aside, next network check {offline.NextSwitchAt:HH:mm:ss}");
+
+        wallpapers.RefreshReason(offline, acOnline: true, networkDown: false);
+        var leftAfterNetwork = offline.NextSwitchAt - offlineAt;
+
+        check("the cycle resumes with the wait it had left, not a new cycle",
+            offline.PauseReason.Length == 0
+            && offline.PausedRemaining == TimeSpan.Zero
+            && leftAfterNetwork > TimeSpan.FromMinutes(26) - TimeSpan.FromSeconds(3)
+            && leftAfterNetwork <= TimeSpan.FromMinutes(26) + TimeSpan.FromSeconds(3)
+            && offline.NextSwitchAt < DateTime.Now.AddMinutes(29),
+            $"{Strings.Countdown(leftAfterNetwork)} left, not 30m");
+
+        // A pause that takes over a pause keeps the same wait, and a running cycle still counts
+        // towards its own moment.
+        var running = wallpapers.RefreshReason(
+            new AppState { SwitchMode = SwitchSchedule.Interval30, NextSwitchAt = pauseStarted.AddMinutes(20) },
+            acOnline: true, networkDown: false);
+        check("running cycle counts towards its own moment",
+            running.PauseReason.Length == 0
+            && running.NextSwitchAt == pauseStarted.AddMinutes(20)
+            && running.PausedRemaining == TimeSpan.Zero,
+            $"{Strings.Countdown(running.NextSwitchAt - DateTime.Now)} left");
+
+        var offlineAgain = wallpapers.RefreshReason(running, acOnline: true, networkDown: true);
+        var onBattery = wallpapers.RefreshReason(offlineAgain, acOnline: false, networkDown: false);
+        check("a battery pause taking over a network pause keeps the same wait",
+            onBattery.PauseReason == SwitchSchedule.BatteryReason
+            && onBattery.PausedRemaining == offlineAgain.PausedRemaining
+            && onBattery.NextSwitchAt == DateTime.MaxValue,
+            $"{Strings.Countdown(onBattery.PausedRemaining)} still set aside");
+
+        // A clock cycle keeps its anchor through a pause instead of a wait: it counts nothing down, so
+        // what the pause stops is the switching and not the clock. This is the user's example - four
+        // hours to "按日期每天" when the battery mode starts, and the next midnight is still the answer
+        // while it runs.
+        var nextMidnight = DateTime.Now.AddHours(4).Date.AddDays(1);
+        var dailyPaused = wallpapers.RefreshReason(
+            new AppState { SwitchMode = SwitchSchedule.Daily, NextSwitchAt = nextMidnight },
+            acOnline: false, networkDown: false);
+        check("a clock cycle keeps its anchor instead of a wait",
+            dailyPaused.PauseReason == SwitchSchedule.BatteryReason
+            && dailyPaused.PausedRemaining == TimeSpan.Zero
+            && dailyPaused.NextSwitchAt == DateTime.MaxValue,
+            $"anchor {nextMidnight:yyyy-MM-dd HH:mm}, nothing counted down");
+
+        wallpapers.RefreshReason(dailyPaused, acOnline: true, networkDown: false);
+        check("the daily anchor is still the next midnight after the pause",
+            dailyPaused.PauseReason.Length == 0
+            && dailyPaused.PausedRemaining == TimeSpan.Zero
+            && dailyPaused.NextSwitchAt == nextMidnight,
+            $"next switch {dailyPaused.NextSwitchAt:yyyy-MM-dd HH:mm}");
+
+        // An anchor that passed while the cycle stood still is gone rather than switched to late: this
+        // pause starts half an hour before 0:00 and the battery mode runs past it, so resuming waits
+        // for the next anchor (12:00 that day) instead of switching for the midnight it missed.
+        var midnightPassed = wallpapers.RefreshReason(
+            new AppState { SwitchMode = SwitchSchedule.HalfDay, NextSwitchAt = DateTime.Today.AddHours(23.5) },
+            acOnline: false, networkDown: false);
+        midnightPassed.NextSwitchAt = DateTime.Today;   // the pause carried the moment past 0:00
+
+        wallpapers.RefreshReason(midnightPassed, acOnline: true, networkDown: false);
+        // Every anchor before now is gone: what is left is the next one the clock cycle would pick -
+        // 12:00 when that is still ahead today, the following 0:00 once it is not.
+        var nextAnchor = SwitchSchedule.NextDue(DateTime.Now, SwitchSchedule.HalfDay);
+
+        check("an anchor passed during the pause is skipped, not caught up",
+            midnightPassed.PauseReason.Length == 0
+            && midnightPassed.PausedRemaining == TimeSpan.Zero
+            && midnightPassed.NextSwitchAt == nextAnchor,
+            $"0:00 had passed, so it waits for {midnightPassed.NextSwitchAt:yyyy-MM-dd HH:mm}");
+
+        // A clock cycle holds no wait at all, so its pause cannot leave one behind for another cycle.
+        var noonAnchor = DateTime.Now.Date.AddDays(1).AddHours(12);
+        var halfPaused = wallpapers.RefreshReason(
+            new AppState { SwitchMode = SwitchSchedule.HalfDay, NextSwitchAt = noonAnchor },
+            acOnline: false, networkDown: false);
+        check("a clock-cycle pause sets aside nothing",
+            halfPaused.PauseReason == SwitchSchedule.BatteryReason
+            && halfPaused.PausedRemaining == TimeSpan.Zero,
+            $"anchor {noonAnchor:yyyy-MM-dd HH:mm}, nothing set aside");
+
+        // The user picks another cycle: the length they changed is the thing that starts over, so the
+        // wait the old cycle had left goes with it. This one stores into a throwaway folder, because
+        // OnModeChanged writes the state.
+        var folder = Path.Combine(Path.GetTempPath(), "SimpleWallpaperSelfTest-" + Guid.NewGuid().ToString("N"));
+        AppState.DataDirectoryForSelfTest = folder;
+
+        try
+        {
+            AppState.Mutate(loaded =>
+            {
+                loaded.SwitchMode = SwitchSchedule.Interval30;
+                loaded.PauseReason = SwitchSchedule.BatteryReason;
+                loaded.NextSwitchAt = DateTime.MaxValue;
+                loaded.PausedRemaining = TimeSpan.FromMinutes(19);
+                return true;
+            });
+
+            wallpapers.OnModeChanged(acOnline: false, networkDown: false);
+            var changed = AppState.Load();
+
+            check("a new cycle starts over, battery and all",
+                changed.SwitchMode == SwitchSchedule.Interval30
+                && changed.PauseReason == SwitchSchedule.BatteryReason
+                && changed.PausedRemaining == TimeSpan.Zero,
+                $"wait cleared, still on hold for {changed.PauseReason}");
+        }
+        catch (Exception ex)
+        {
+            check("a new cycle starts over", false, ex.Message);
+        }
+        finally
+        {
+            AppState.DataDirectoryForSelfTest = null;
 
             try
             {
