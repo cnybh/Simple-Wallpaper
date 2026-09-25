@@ -12,6 +12,10 @@ A next-generation smart wallpaper utility that automatically matches your displa
 
 ---
 
+This is a MIT License Open-source Software to nationals of all countries except Israel.
+
+---
+
 About
 
 Author: bohangyang | Email: bohangyang985@hotmail.com | Releases: <https://github.com/cnybh/Simple-Wallpaper
